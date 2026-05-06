@@ -1,0 +1,60 @@
+[package]
+name = "snap7-cli"
+version = "0.1.2"
+edition = "2021"
+description = "CLI tool for communicating with Siemens S7 PLCs — read/write data blocks, watch tags, upload blocks, query SZL"
+license = "MIT"
+repository = "https://github.com/cool0looc/rs-snap7"
+keywords = ["siemens", "s7", "plc", "cli", "snap7"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
+
+[[bin]]
+name = "snap7"
+path = "src/main.rs"
+
+[[bin]]
+name = "snap7-test-server"
+path = "src/bin/test_server.rs"
+
+[[bin]]
+name = "snap7-sensor-server"
+path = "src/bin/sensor_server.rs"
+
+[[bin]]
+name = "plc_batch_reader"
+path = "src/bin/plc_batch_reader.rs"
+required-features = ["opcua"]
+
+[[bin]]
+name = "gateway_demo"
+path = "src/bin/gateway_demo.rs"
+required-features = ["opcua"]
+
+[[bin]]
+name = "opcua_subscriber"
+path = "src/bin/opcua_subscriber.rs"
+required-features = ["opcua"]
+
+[dependencies]
+snap7-client = { version = "0.1.2", path = "../crates/snap7-client" }
+snap7-server = { version = "0.1.2", path = "../crates/snap7-server" }
+snap7-opcua-gateway = { version = "0.1.2", path = "../crates/snap7-opcua-gateway", optional = true }
+opcua = { package = "async-opcua", version = "0.18", features = ["client"], optional = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "fs", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+hex = "0.4"
+bytes = "1"
+toml = { version = "0.8", optional = true }
+rand = "0.8"
+chrono = "0.4"
+
+[features]
+default = []
+opcua = ["dep:snap7-opcua-gateway", "dep:toml", "dep:opcua"]
+
+[dev-dependencies]
+assert_cmd = "2"

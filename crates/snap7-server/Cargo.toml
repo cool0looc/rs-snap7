@@ -1,0 +1,20 @@
+[package]
+name = "snap7-server"
+version = "0.1.2"
+edition = "2021"
+description = "Async Rust S7 PLC simulator/server for testing and development"
+license = "MIT"
+repository = "https://github.com/cool0looc/rs-snap7"
+keywords = ["siemens", "s7", "plc", "industrial", "snap7"]
+categories = ["network-programming", "embedded"]
+readme = "README.md"
+
+
+[dependencies]
+thiserror = "2"
+snap7-client = { version = "0.1.2", path = "../snap7-client" }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "io-util", "sync", "macros"] }
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time"] }

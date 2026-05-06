@@ -1,0 +1,29 @@
+[package]
+name = "snap7-bench"
+version = "0.1.2"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Benchmarks for snap7 crates"
+repository = "https://github.com/cool0looc/rs-snap7"
+
+[lib]
+name = "snap7_bench_helper"
+path = "src/lib.rs"
+
+[[bench]]
+name = "s7_ops"
+harness = false
+
+[[bench]]
+name = "s7_ops_sync"
+harness = false
+
+[dependencies]
+snap7-client = { version = "0.1.2", path = "../crates/snap7-client" }
+snap7-server = { version = "0.1.2", path = "../crates/snap7-server" }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time", "sync"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time", "sync"] }

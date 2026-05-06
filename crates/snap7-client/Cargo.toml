@@ -1,0 +1,26 @@
+[package]
+name = "snap7-client"
+version = "0.1.2"
+edition = "2021"
+description = "Async Rust client for Siemens S7 PLCs over ISO-on-TCP (S7Comm and S7CommPlus)"
+license = "MIT"
+repository = "https://github.com/cool0looc/rs-snap7"
+keywords = ["siemens", "s7", "plc", "industrial", "snap7"]
+categories = ["network-programming", "embedded"]
+readme = "README.md"
+
+[features]
+sync = []
+
+[dependencies]
+bytes = "1"
+thiserror = "2"
+hmac = "0.12"
+sha2 = "0.10"
+tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+webpki-roots = "0.26"
+
+[dev-dependencies]
+tokio-test = "0.4"
