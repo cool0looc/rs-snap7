@@ -1,0 +1,6 @@
+# Cross-compilation configuration for ARM v7 using zig wrappers
+[target.armv7-unknown-linux-gnueabihf]
+linker = "/home/oser/bin/zig-wrappers/arm-linux-gnueabihf-gcc"
+
+[build]
+target = "armv7-unknown-linux-gnueabihf"

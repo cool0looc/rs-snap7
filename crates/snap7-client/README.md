@@ -6,14 +6,25 @@ Part of the [rs-snap7](https://github.com/cool0looc/rs-snap7) workspace.
 
 ## Features
 
-- `S7Client` — async read/write for S7-300/400/1200/1500 via S7Comm
-- `S7PlusClient` — S7CommPlus (S7-1200/1500 newer firmware)
-- `S7Pool` — bounded connection pool with RAII checkout
-- Multi-read / multi-write — batched PDU packing, automatic splitting at PDU limit
-- Typed tag access — `DB1,REAL4`, `DB70,332.0` (bit), `DB1,INT8`, etc.
-- TLS transport — encrypted S7CommPlus via `tokio-rustls`
-- UDP transport
-- `sync` feature — blocking wrapper around the async client
+| Capability | Status |
+|---|---|
+| **S7Comm** (S7-300/400) — read/write DB, multi-area, blocks, SZL | ✅ |
+| **S7CommPlus** (S7-1200/1500 integrity mode) | ✅ |
+| **Connection pool** (`S7Pool`) with RAII checkout | ✅ |
+| **Multi-read / multi-write** with automatic PDU batching | ✅ |
+| **Typed tag addressing** — `DB1,REAL4`, `DB70,332.0`, `DB1,INT8` | ✅ |
+| **Tag read/write** with type decoding/encoding | ✅ |
+| **Area absolute addressing** — Merker, PA, PI, etc. | ✅ |
+| **Block operations** — list, info, upload, download, delete, fill | ✅ |
+| **PLC control** — stop, hot-start, cold-start, status | ✅ |
+| **PLC information** — order code, CPU info, CP info, module list | ✅ |
+| **Session password** — set, clear, read protection level | ✅ |
+| **SZL queries** — system status list, clock, protection | ✅ |
+| **Copy RAM → ROM, compress memory** | ✅ |
+| **TLS transport** (S7CommPlus encrypted via `tokio-rustls`) | ✅ |
+| **UDP transport** | ✅ |
+| **Sync (blocking) API** — via `sync` feature | ✅ |
+| **Pure Rust, zero native dependencies** | ✅ |
 
 ## Add to your project
 

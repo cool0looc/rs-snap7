@@ -6,10 +6,15 @@ Part of the [rs-snap7](https://github.com/cool0looc/rs-snap7) workspace.
 
 ## Features
 
-- Polls any S7 tag address (`DB1,REAL4`, `DB70,332.0`, etc.) on a configurable interval
-- Exposes tags as OPC-UA nodes — readable and optionally writable
-- OPC-UA subscriptions: clients receive notifications when values change
-- TOML-based configuration
+| Capability | Status |
+|---|---|
+| **S7 tag polling** — any tag address, configurable interval | ✅ |
+| **OPC-UA variable nodes** — `ns=2;s=<name>` | ✅ |
+| **Subscriptions** — OPC-UA clients get change notifications | ✅ |
+| **Writable tags** — write-through from OPC-UA to PLC | ✅ |
+| **TOML configuration file** | ✅ |
+| **Async, non-blocking** — tokio-based polling loop | ✅ |
+| **Pure Rust, zero native dependencies** | ✅ |
 
 ## Add to your project
 

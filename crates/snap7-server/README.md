@@ -4,11 +4,21 @@ In-process S7 PLC simulator for testing and development. Pure Rust — no FFI, n
 
 Part of the [rs-snap7](https://github.com/cool0looc/rs-snap7) workspace.
 
-## Use cases
+## Features
 
-- Unit / integration tests without a physical PLC
-- CI pipelines
-- Local development
+| Capability | Status |
+|---|---|
+| **S7Comm read/write dispatch** — handles `ReadVar` / `WriteVar` requests | ✅ |
+| **Multi-item read/write** — single-PDU multi-area operations | ✅ |
+| **DataStore** — thread-safe in-memory store by `(area, db, offset)` | ✅ |
+| **Area registration** — PI, PA, MK, DB, timer, counter, etc. | ✅ |
+| **CPU state tracking** — RUN / STOP with state-change callbacks | ✅ |
+| **Read / write event callbacks** | ✅ |
+| **Max connections limit** | ✅ |
+| **Ephemeral port support** — `127.0.0.1:0` for tests | ✅ |
+| **Pure Rust, zero native dependencies** | ✅ |
+
+## Use cases
 
 ## Add to your project
 

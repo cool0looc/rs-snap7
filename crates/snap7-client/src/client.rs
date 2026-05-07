@@ -716,7 +716,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let _block_len = b.get_u16();
         let _szl_id = b.get_u16();
         let _szl_ix = b.get_u16();
-        // Order code is the first 20 bytes of SZL data, space-padded
+
+        // Validate the response: the szl_id returned by the PLC must match
+        // what we requested.  If not, this SZL ID is not supported.
+        let resp_szl_id = _szl_id;
+        if resp_szl_id != 0x0011 {
+            return Err(Error::PlcError {
+                code: 0,
+                message: format!(
+                    "order-code query (SZL 0x0011) not supported by this PLC (returned szl_id=0x{:04X})",
+                    resp_szl_id
+                ),
+            });
+        }
+
+        // Order code is the first 20 bytes of SZL entry data, space-padded
         let code_bytes = &b[..b.len().min(20)];
         let code = String::from_utf8_lossy(code_bytes).trim().to_string();
         Ok(crate::types::OrderCode { code })
@@ -736,18 +750,30 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let _szl_id = b.get_u16();
         let _szl_ix = b.get_u16();
 
+        // Validate the response: the szl_id returned by the PLC must match
+        // what we requested.  If not, this SZL ID is not supported.
+        let resp_szl_id = _szl_id;
+        if resp_szl_id != 0x001C {
+            return Err(Error::PlcError {
+                code: 0,
+                message: format!(
+                    "cpu-info query (SZL 0x001C) not supported by this PLC (returned szl_id=0x{:04X})",
+                    resp_szl_id
+                ),
+            });
+        }
+
         // SZL 0x001C response layout (each field is left-aligned, space-padded):
         //   [0..24]  Module type name
         //   [24..48] Serial number
         //   [48..72] Plant identification (AS name)
         //   [72..98] Copyright (26 bytes)
         //   [98..122] Module name (24 bytes)
-        let data = &b[..b.len().min(122)];
-        let module_type = String::from_utf8_lossy(&data[0..24.min(data.len())]).trim().to_string();
-        let serial_number = String::from_utf8_lossy(&data[24..48.min(data.len())]).trim().to_string();
-        let as_name = String::from_utf8_lossy(&data[48..72.min(data.len())]).trim().to_string();
-        let copyright = String::from_utf8_lossy(&data[72..98.min(data.len())]).trim().to_string();
-        let module_name = String::from_utf8_lossy(&data[98..122.min(data.len())]).trim().to_string();
+        let module_type = extract_szl_string(&b, 0, 24);
+        let serial_number = extract_szl_string(&b, 24, 48);
+        let as_name = extract_szl_string(&b, 48, 72);
+        let copyright = extract_szl_string(&b, 72, 98);
+        let module_name = extract_szl_string(&b, 98, 122);
         Ok(crate::types::CpuInfo {
             module_type,
             serial_number,
@@ -769,6 +795,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let _block_len = b.get_u16();
         let _szl_id = b.get_u16();
         let _szl_ix = b.get_u16();
+        // Skip the optional SZL entry_length prefix (2 bytes).
+        skip_szl_entry_header(&mut b);
         // Next 16 bytes: 4 × u32 big-endian
         let max_pdu_len = b.get_u32();
         let max_connections = b.get_u32();
@@ -794,6 +822,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let _block_len = b.get_u16();
         let _szl_id = b.get_u16();
         let _szl_ix = b.get_u16();
+        // Skip the optional SZL entry_length prefix (2 bytes).
+        skip_szl_entry_header(&mut b);
         let mut modules = Vec::new();
         while b.remaining() >= 2 {
             modules.push(crate::types::ModuleEntry {
@@ -817,6 +847,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let _block_len = b.get_u16();
         let _szl_id = b.get_u16();
         let _szl_ix = b.get_u16();
+        // Skip the optional SZL entry_length prefix (2 bytes).
+        skip_szl_entry_header(&mut b);
         let total_count = b.get_u32();
         let mut entries = Vec::new();
         while b.remaining() >= 4 {
@@ -1015,6 +1047,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let _block_len = b.get_u16();
         let _szl_id = b.get_u16();
         let _szl_ix = b.get_u16();
+        // Skip the optional SZL entry_length prefix (2 bytes).
+        skip_szl_entry_header(&mut b);
         let scheme_szl = b.get_u16();
         let scheme_module = b.get_u16();
         let scheme_bus = b.get_u16();
@@ -1275,12 +1309,48 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
     }
 }
 
+/// If the leading bytes look like an SZL entry_length header (2-byte big-endian u16
+/// length value where the high byte is zero), skip them.  Real Siemens PLCs include
+/// this header; our test server omits it.
+fn skip_szl_entry_header(data: &mut Bytes) {
+    if data.len() >= 2 && data[0] == 0x00 && data[1] > 0 && data[1] <= 200 {
+        data.advance(2);
+    }
+}
+
+/// Safely extract a fixed-width space-padded string field from SZL response data.
+///
+/// Returns the trimmed string, or an empty string if `start` is beyond the data length.
+fn extract_szl_string(data: &[u8], start: usize, end: usize) -> String {
+    if start >= data.len() {
+        return String::new();
+    }
+    let end = end.min(data.len());
+    String::from_utf8_lossy(&data[start..end]).trim().to_string()
+}
+
+/// Decode common S7 protocol error class/code pairs into human-readable descriptions.
+fn s7_error_description(ec: u8, ecd: u8) -> &'static str {
+    match (ec, ecd) {
+        (0x81, 0x04) => "function not supported or access denied by PLC",
+        (0x81, 0x01) => "reserved by HW or SW function not available",
+        (0x82, 0x04) => "PLC is in STOP mode, function not possible",
+        (0x05, 0x01) => "invalid block type number",
+        (0xD2, 0x01) => "object already exists, download rejected",
+        (0xD2, 0x02) => "object does not exist, upload failed",
+        (0xD6, 0x01) => "password protection violation",
+        (0xD6, 0x05) => "insufficient privilege for this operation",
+        _ => "unknown error",
+    }
+}
+
 fn check_plc_error(header: &S7Header, context: &str) -> Result<()> {
     if let (Some(ec), Some(ecd)) = (header.error_class, header.error_code) {
         if ec != 0 || ecd != 0 {
+            let detail = s7_error_description(ec, ecd);
             return Err(Error::PlcError {
                 code: ((ec as u32) << 8) | ecd as u32,
-                message: format!("{} error", context),
+                message: format!("{}: {} (error_class=0x{ec:02X}, error_code=0x{ecd:02X})", context, detail),
             });
         }
     }

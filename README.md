@@ -2,7 +2,7 @@
 
 Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates with S7-300/400/1200/1500 PLCs over ISO-on-TCP without any native C dependency.
 
-> **Status:** v0.1.3 — functional, pre-1.0. API may change.
+> **Status:** v0.1.4 — functional, pre-1.0. API may change.
 
 ## Features
 
