@@ -8,4 +8,5 @@ pub use dispatch::dispatch_loop;
 pub use error::Error;
 pub use handshake::server_handshake;
 pub use server::{S7Server, ServerConfig};
-pub use store::DataStore;
+pub use store::{CpuState, DataStore, EventInfo};
+pub use store::area;

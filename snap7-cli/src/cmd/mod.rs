@@ -1,5 +1,8 @@
 pub mod block;
 pub mod diag;
+pub mod info;
+pub mod password;
+pub mod plc_control;
 pub mod read;
 #[cfg(feature = "opcua")]
 pub mod serve;
@@ -57,6 +60,9 @@ pub async fn run() -> Result<()> {
         Command::Szl(args) => szl::run(&client, args, &cli.format).await?,
         Command::Diag => diag::run(&client).await?,
         Command::Watch(args) => watch::run(&client, args).await?,
+        Command::PlcControl(args) => plc_control::run(&client, args).await?,
+        Command::Info(args) => info::run(&client, args).await?,
+        Command::Password(args) => password::run(&client, args).await?,
         #[cfg(feature = "opcua")]
         Command::Serve(_) => unreachable!(), // Handled above
     }

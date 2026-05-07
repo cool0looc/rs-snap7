@@ -1,6 +1,6 @@
 [package]
 name = "snap7-opcua-gateway"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "OPC-UA gateway that bridges Siemens S7 PLCs to OPC-UA clients with subscription support"
 license = "MIT"
@@ -10,7 +10,7 @@ categories = ["network-programming", "embedded"]
 readme = "README.md"
 
 [dependencies]
-snap7-client = { version = "0.1.2", path = "../snap7-client" }
+snap7-client = { version = "0.1.3", path = "../snap7-client" }
 async-opcua = { version = "0.18", features = ["server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 thiserror = "2"

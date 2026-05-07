@@ -1,13 +1,19 @@
 use bytes::{Bytes, BytesMut};
+use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::proto::s7commplus::frame::{S7PlusFrame, Version};
-use crate::proto::s7commplus::multivar::{GetVarRequest, GetVarResponse, SetVarRequest};
+use crate::proto::s7commplus::multivar::{
+    GetMultiVarRequest, GetMultiVarResponse, SetMultiVarRequest, SetVarItem, VarSpec,
+};
+use crate::proto::s7commplus::session::{FC_DELETE_OBJECT, OPCODE_REQUEST};
+use crate::proto::s7commplus::data::DataArea;
 use crate::proto::tpkt::TpktFrame;
 
 use crate::error::Error;
 use crate::plus_connection::{plus_connect, PlusConnection};
+use crate::tls::{tls_connect, TlsStream};
 use crate::transport::TcpTransport;
 
 /// Inner mutable state for an `S7PlusClient`.
@@ -27,19 +33,53 @@ fn db_lid(db: u16, byte_offset: u32) -> (u32, u32) {
     (crc, lid)
 }
 
+/// Specification for a single DB variable to be read or written in batch.
+#[derive(Debug, Clone)]
+pub struct DbVarSpec {
+    pub db: u16,
+    pub offset: u32,
+    pub length: u16,
+}
+
+// ---------------------------------------------------------------------------
+// Generic transport methods
+// ---------------------------------------------------------------------------
+
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7PlusClient<T> {
     /// Read `length` bytes from DB `db` at byte offset `start`.
     pub async fn db_read(&self, db: u16, start: u32, length: u16) -> Result<Bytes, Error> {
+        let r = self.read_multi_vars(&[DbVarSpec { db, offset: start, length }]).await?;
+        Ok(r.into_iter().next().unwrap_or_default())
+    }
+
+    /// Write `data` to DB `db` at byte offset `start`.
+    pub async fn db_write(&self, db: u16, start: u32, data: &[u8]) -> Result<(), Error> {
+        self.write_multi_vars(&[DbVarSpec { db, offset: start, length: data.len() as u16 }], &[Bytes::copy_from_slice(data)]).await
+    }
+
+    /// Read multiple DB variables in a single S7CommPlus PDU.
+    ///
+    /// Each `DbVarSpec` specifies the DB number, byte offset, and read length.
+    /// Returns one `Bytes` per input spec in the same order.
+    pub async fn read_multi_vars(&self, specs: &[DbVarSpec]) -> Result<Vec<Bytes>, Error> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut inner = self.inner.lock().await;
         let seqnum = inner.conn.seqnum;
         inner.conn.seqnum = seqnum.wrapping_add(1);
-        let (crc, lid) = db_lid(db, start);
+        let items: Vec<VarSpec> = specs
+            .iter()
+            .map(|s| {
+                let (crc, lid) = db_lid(s.db, s.offset);
+                VarSpec { crc, lid }
+            })
+            .collect();
 
-        let req = GetVarRequest {
+        let req = GetMultiVarRequest {
             seqnum,
             session_id: inner.conn.session_id,
-            crc,
-            lid,
+            items,
         };
         let mut da = BytesMut::new();
         req.encode(&mut da);
@@ -48,43 +88,111 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7PlusClient<T> {
         send_plus(&mut inner.transport, version, da.freeze()).await?;
         let data = recv_plus_data(&mut inner.transport).await?;
         let mut b = data;
-        let resp = GetVarResponse::decode(&mut b).map_err(Error::Proto)?;
-        let len = length as usize;
-        if resp.value.len() >= len {
-            Ok(resp.value.slice(..len))
-        } else {
-            Ok(resp.value)
-        }
+        let resp = GetMultiVarResponse::decode(&mut b, specs.len()).map_err(Error::Proto)?;
+        let results: Vec<Bytes> = resp
+            .items
+            .into_iter()
+            .zip(specs.iter())
+            .map(|(item, spec)| {
+                let len = spec.length as usize;
+                if item.value.len() >= len {
+                    item.value.slice(..len)
+                } else {
+                    item.value
+                }
+            })
+            .collect();
+        Ok(results)
     }
 
-    /// Write `data` to DB `db` at byte offset `start`.
-    pub async fn db_write(&self, db: u16, start: u32, data: &[u8]) -> Result<(), Error> {
+    /// Write multiple DB variables in a single S7CommPlus PDU.
+    ///
+    /// `specs` describes where to write, and `values` provides the data (one per spec).
+    pub async fn write_multi_vars(&self, specs: &[DbVarSpec], values: &[Bytes]) -> Result<(), Error> {
+        if specs.is_empty() {
+            return Ok(());
+        }
         let mut inner = self.inner.lock().await;
         let seqnum = inner.conn.seqnum;
         inner.conn.seqnum = seqnum.wrapping_add(1);
-        let (crc, lid) = db_lid(db, start);
+        let items: Vec<SetVarItem> = specs
+            .iter()
+            .zip(values.iter())
+            .map(|(s, v)| {
+                let (crc, lid) = db_lid(s.db, s.offset);
+                SetVarItem {
+                    crc,
+                    lid,
+                    value: v.clone(),
+                }
+            })
+            .collect();
 
-        let req = SetVarRequest {
+        let req = SetMultiVarRequest {
             seqnum,
             session_id: inner.conn.session_id,
-            crc,
-            lid,
-            value: Bytes::copy_from_slice(data),
+            items,
         };
         let mut da = BytesMut::new();
         req.encode(&mut da);
 
         let version = inner.conn.version.clone();
         send_plus(&mut inner.transport, version, da.freeze()).await?;
+        let _data = recv_plus_data(&mut inner.transport).await?;
+        Ok(())
+    }
+
+    /// Send a KeepAlive frame to maintain the S7CommPlus session.
+    pub async fn send_keepalive(&self) -> Result<(), Error> {
+        let mut inner = self.inner.lock().await;
+        let frame = S7PlusFrame {
+            version: Version::KeepAlive,
+            data: Bytes::new(),
+        };
+        let mut fb = BytesMut::new();
+        frame.encode(&mut fb).map_err(Error::Proto)?;
+        let tpkt = TpktFrame {
+            payload: fb.freeze(),
+        };
+        let mut tb = BytesMut::new();
+        tpkt.encode(&mut tb).map_err(Error::Proto)?;
+        inner.transport.write_all(&tb).await?;
+        Ok(())
+    }
+
+    /// Send a DeleteObject request to close the session on the PLC.
+    pub async fn delete_object(&self) -> Result<(), Error> {
+        let mut inner = self.inner.lock().await;
+        let seqnum = inner.conn.seqnum;
+        inner.conn.seqnum = seqnum.wrapping_add(1);
+
+        // DeleteObject uses the same DataArea / FC_DELETE_OBJECT
+        let da = DataArea {
+            opcode: OPCODE_REQUEST,
+            function_code: FC_DELETE_OBJECT,
+            seqnum,
+            session_id: inner.conn.session_id,
+            transport_flags: 0,
+            payload: Bytes::new(),
+        };
+        let mut buf = BytesMut::new();
+        da.encode(&mut buf);
+
+        let version = inner.conn.version.clone();
+        send_plus(&mut inner.transport, version, buf.freeze()).await?;
         let _resp = recv_plus_data(&mut inner.transport).await?;
         Ok(())
     }
 }
 
+// ---------------------------------------------------------------------------
+// TCP transport
+// ---------------------------------------------------------------------------
+
 impl S7PlusClient<TcpTransport> {
     /// Connect to a PLC at `addr` using the S7CommPlus CreateObject handshake.
     pub async fn connect(
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         params: crate::types::ConnectParams,
     ) -> Result<Self, Error> {
         let transport = TcpTransport::connect(addr, params.connect_timeout).await?;
@@ -94,6 +202,33 @@ impl S7PlusClient<TcpTransport> {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// TLS transport
+// ---------------------------------------------------------------------------
+
+impl S7PlusClient<TlsStream> {
+    /// Connect to a PLC using TLS transport and the S7CommPlus handshake.
+    ///
+    /// `server_name` is used for TLS SNI.  `extra_ca_der` can be `None` to
+    /// use the system root store.
+    pub async fn connect_tls(
+        addr: SocketAddr,
+        server_name: &str,
+        extra_ca_der: Option<&[u8]>,
+        _params: crate::types::ConnectParams,
+    ) -> Result<Self, Error> {
+        let transport = tls_connect(addr, server_name, extra_ca_der).await?;
+        let (conn, transport) = plus_connect(transport).await?;
+        Ok(S7PlusClient {
+            inner: Mutex::new(PlusInner { transport, conn }),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
 
 async fn send_plus<T>(transport: &mut T, version: Version, data: Bytes) -> Result<(), Error>
 where

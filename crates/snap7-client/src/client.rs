@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -69,11 +69,11 @@ struct Inner<T> {
     transport: T,
     connection: Connection,
     pdu_ref: u16,
+    request_timeout: std::time::Duration,
 }
 
 pub struct S7Client<T: AsyncRead + AsyncWrite + Unpin + Send> {
     inner: Mutex<Inner<T>>,
-    #[allow(dead_code)]
     params: ConnectParams,
 }
 
@@ -81,14 +81,63 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
     pub async fn from_transport(transport: T, params: ConnectParams) -> Result<Self> {
         let mut t = transport;
         let connection = connect(&mut t, &params).await?;
+        let timeout = params.request_timeout;
         Ok(S7Client {
             inner: Mutex::new(Inner {
                 transport: t,
                 connection,
                 pdu_ref: 1,
+                request_timeout: timeout,
             }),
             params,
         })
+    }
+
+    /// Return the current request timeout.
+    pub fn request_timeout(&self) -> std::time::Duration {
+        self.params.request_timeout
+    }
+
+    /// Update the request timeout at runtime.
+    ///
+    /// This affects subsequent `recv_s7` calls made by this client instance.
+    pub async fn set_request_timeout(&self, timeout: std::time::Duration) {
+        let mut inner = self.inner.lock().await;
+        inner.request_timeout = timeout;
+    }
+
+    /// Read a client parameter by name.
+    ///
+    /// Supported names: `"request_timeout"`, `"connect_timeout"`, `"pdu_size"`.
+    pub fn get_param(&self, name: &str) -> Result<std::time::Duration> {
+        match name {
+            "request_timeout" => Ok(self.params.request_timeout),
+            "connect_timeout" => Ok(self.params.connect_timeout),
+            "pdu_size" => Err(Error::PlcError {
+                code: 0,
+                message: "pdu_size is not a Duration; use .params.pdu_size directly".into(),
+            }),
+            _ => Err(Error::PlcError {
+                code: 0,
+                message: format!("unknown parameter: {name}"),
+            }),
+        }
+    }
+
+    /// Set a client parameter at runtime.
+    ///
+    /// Supported names: `"request_timeout"` (Duration).
+    pub fn set_param(&mut self, name: &str, value: std::time::Duration) -> Result<()> {
+        match name {
+            "request_timeout" => {
+                self.params.request_timeout = value;
+                Ok(())
+            }
+            _ => Err(Error::PlcError {
+                code: 0,
+                message: format!("unknown parameter: {name}"),
+            }),
+        }
     }
 
     fn next_pdu_ref(inner: &mut Inner<T>) -> u16 {
@@ -134,14 +183,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
     }
 
     async fn recv_s7(inner: &mut Inner<T>) -> Result<(S7Header, Bytes)> {
+        let timeout = inner.request_timeout;
         let mut tpkt_hdr = [0u8; 4];
-        inner.transport.read_exact(&mut tpkt_hdr).await?;
+        tokio::time::timeout(timeout, inner.transport.read_exact(&mut tpkt_hdr))
+            .await
+            .map_err(|_| Error::Timeout(timeout))??;
         let total = u16::from_be_bytes([tpkt_hdr[2], tpkt_hdr[3]]) as usize;
         if total < 4 {
             return Err(Error::UnexpectedResponse);
         }
         let mut payload = vec![0u8; total - 4];
-        inner.transport.read_exact(&mut payload).await?;
+        tokio::time::timeout(timeout, inner.transport.read_exact(&mut payload))
+            .await
+            .map_err(|_| Error::Timeout(timeout))??;
         let mut b = Bytes::from(payload);
 
         // COTP DT header: LI (1) + code (1) + tpdu_nr (1)
@@ -441,7 +495,57 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         Ok(())
     }
 
+    /// Read from any PLC area using absolute addressing.
+    ///
+    /// A convenience wrapper around [`read_multi_vars`](Self::read_multi_vars)
+    /// for a single area read.
+    pub async fn ab_read(
+        &self,
+        area: Area,
+        db_number: u16,
+        start: u32,
+        length: u16,
+    ) -> Result<Bytes> {
+        let items = [MultiReadItem {
+            area,
+            db_number,
+            start,
+            length,
+            transport: TransportSize::Byte,
+        }];
+        let mut results = self.read_multi_vars(&items).await?;
+        Ok(results.swap_remove(0))
+    }
+
+    /// Write to any PLC area using absolute addressing.
+    ///
+    /// A convenience wrapper around [`write_multi_vars`](Self::write_multi_vars)
+    /// for a single area write.
+    pub async fn ab_write(
+        &self,
+        area: Area,
+        db_number: u16,
+        start: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        let items = [MultiWriteItem {
+            area,
+            db_number,
+            start,
+            data: Bytes::copy_from_slice(data),
+        }];
+        self.write_multi_vars(&items).await
+    }
+
     pub async fn read_szl(&self, szl_id: u16, szl_index: u16) -> Result<SzlResponse> {
+        let payload = self.read_szl_payload(szl_id, szl_index).await?;
+        let mut b = payload;
+        Ok(SzlResponse::decode(&mut b)?)
+    }
+
+    /// Send a UserData SZL query and return the raw SZL data block payload
+    /// (starting with block_len, szl_id, szl_index, then the data).
+    async fn read_szl_payload(&self, szl_id: u16, szl_index: u16) -> Result<Bytes> {
         let mut inner = self.inner.lock().await;
         let pdu_ref = Self::next_pdu_ref(&mut inner);
 
@@ -458,11 +562,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         )
         .await?;
 
-        let (_header, mut body) = Self::recv_s7(&mut inner).await?;
-        if body.remaining() > 12 {
-            body.advance(body.remaining() - 12);
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+
+        // Skip the echoed param section
+        if body.remaining() < header.param_len as usize {
+            return Err(Error::UnexpectedResponse);
         }
-        Ok(SzlResponse::decode(&mut body)?)
+        body.advance(header.param_len as usize);
+
+        // body is now the data section.
+        // Skip the 4-byte data envelope: return_code(1) + transport(1) + data_len(2)
+        if body.remaining() < 4 {
+            return Err(Error::UnexpectedResponse);
+        }
+        body.advance(4);
+
+        // Remaining is the SZL data block: block_len(2) + szl_id(2) + szl_ix(2) + data
+        Ok(body.copy_to_bytes(body.remaining()))
     }
 
     pub async fn read_clock(&self) -> Result<PlcDateTime> {
@@ -484,6 +600,679 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         }
         Ok(PlcDateTime::decode(&mut body)?)
     }
+
+    /// Copy RAM data to ROM (function 0x43).
+    ///
+    /// Copies the CPU's work memory to its load memory (retain on power-off).
+    pub async fn copy_ram_to_rom(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        let param = Bytes::copy_from_slice(&[
+            0x00, 0x01, 0x12, 0x04, 0x43, 0x44, 0x01, 0x00,
+        ]);
+        Self::send_s7(&mut inner, param, Bytes::new(), pdu_ref, PduType::UserData).await?;
+        let (header, _body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "copy_ram_to_rom")?;
+        Ok(())
+    }
+
+    /// Compress the PLC work memory (function 0x42).
+    ///
+    /// Reorganises memory to eliminate fragmentation.  The PLC must be in STOP
+    /// mode before calling this.
+    pub async fn compress(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        let param = Bytes::copy_from_slice(&[
+            0x00, 0x01, 0x12, 0x04, 0x42, 0x44, 0x01, 0x00,
+        ]);
+        Self::send_s7(&mut inner, param, Bytes::new(), pdu_ref, PduType::UserData).await?;
+        let (header, _body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "compress")?;
+        Ok(())
+    }
+
+    // -- PLC control & status -------------------------------------------------
+
+    /// Send a simple Job with a 2-byte parameter (func + 0x00) and no data.
+    async fn simple_control(inner: &mut Inner<T>, pdu_ref: u16, func: u8) -> Result<()> {
+        let param = Bytes::copy_from_slice(&[func, 0x00]);
+        Self::send_s7(inner, param, Bytes::new(), pdu_ref, PduType::Job).await?;
+        let (header, _body) = Self::recv_s7(inner).await?;
+        check_plc_error(&header, "plc_control")?;
+        Ok(())
+    }
+
+    /// Stop the PLC (S7 function code 0x29).
+    ///
+    /// Sends a Job request with no additional data. Returns `Ok(())` when the
+    /// PLC acknowledges the command, or an error if the PLC rejects it
+    /// (e.g., password-protected or CPU in a non-stoppable state).
+    pub async fn plc_stop(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        Self::simple_control(&mut inner, pdu_ref, 0x29).await
+    }
+
+    /// Hot-start (warm restart) the PLC (S7 function code 0x28).
+    ///
+    /// A warm restart retains the DB content and retentive memory.
+    pub async fn plc_hot_start(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        Self::simple_control(&mut inner, pdu_ref, 0x28).await
+    }
+
+    /// Cold-start (full restart) the PLC (S7 function code 0x2A).
+    ///
+    /// A cold start clears all DBs and non-retentive memory.
+    pub async fn plc_cold_start(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        Self::simple_control(&mut inner, pdu_ref, 0x2A).await
+    }
+
+    /// Read the current PLC status (S7 function code 0x31).
+    ///
+    /// Returns one of [`PlcStatus::Run`], [`PlcStatus::Stop`], or
+    /// [`PlcStatus::Unknown`].
+    pub async fn get_plc_status(&self) -> Result<crate::types::PlcStatus> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        let param = Bytes::copy_from_slice(&[0x31, 0x00]);
+        Self::send_s7(&mut inner, param, Bytes::new(), pdu_ref, PduType::Job).await?;
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "get_plc_status")?;
+        // Skip param echo: func (1) + reserved (1)
+        if body.remaining() >= 2 {
+            body.advance(2);
+        }
+        if body.remaining() < 1 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let status_byte = body.get_u8();
+        match status_byte {
+            0x00 => Ok(crate::types::PlcStatus::Unknown),
+            0x04 => Ok(crate::types::PlcStatus::Stop),
+            0x08 => Ok(crate::types::PlcStatus::Run),
+            other => Err(Error::PlcError {
+                code: other as u32,
+                message: format!("unknown PLC status byte: 0x{other:02X}"),
+            }),
+        }
+    }
+
+    // -- PLC information queries (via SZL UserData) ---------------------------
+
+    /// Read the PLC order code (SZL ID 0x0011).
+    ///
+    /// The order code is a 20-character ASCII string (e.g. `"6ES7 317-2EK14-0AB0"`).
+    pub async fn get_order_code(&self) -> Result<crate::types::OrderCode> {
+        let payload = self.read_szl_payload(0x0011, 0x0000).await?;
+        if payload.len() < 8 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mut b = payload;
+        let _block_len = b.get_u16();
+        let _szl_id = b.get_u16();
+        let _szl_ix = b.get_u16();
+        // Order code is the first 20 bytes of SZL data, space-padded
+        let code_bytes = &b[..b.len().min(20)];
+        let code = String::from_utf8_lossy(code_bytes).trim().to_string();
+        Ok(crate::types::OrderCode { code })
+    }
+
+    /// Read detailed CPU information (SZL ID 0x001C).
+    ///
+    /// Returns module type, serial number, plant identification, copyright
+    /// and module name fields pre-parsed from the SZL response.
+    pub async fn get_cpu_info(&self) -> Result<crate::types::CpuInfo> {
+        let payload = self.read_szl_payload(0x001C, 0x0000).await?;
+        if payload.len() < 8 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mut b = payload;
+        let _block_len = b.get_u16();
+        let _szl_id = b.get_u16();
+        let _szl_ix = b.get_u16();
+
+        // SZL 0x001C response layout (each field is left-aligned, space-padded):
+        //   [0..24]  Module type name
+        //   [24..48] Serial number
+        //   [48..72] Plant identification (AS name)
+        //   [72..98] Copyright (26 bytes)
+        //   [98..122] Module name (24 bytes)
+        let data = &b[..b.len().min(122)];
+        let module_type = String::from_utf8_lossy(&data[0..24.min(data.len())]).trim().to_string();
+        let serial_number = String::from_utf8_lossy(&data[24..48.min(data.len())]).trim().to_string();
+        let as_name = String::from_utf8_lossy(&data[48..72.min(data.len())]).trim().to_string();
+        let copyright = String::from_utf8_lossy(&data[72..98.min(data.len())]).trim().to_string();
+        let module_name = String::from_utf8_lossy(&data[98..122.min(data.len())]).trim().to_string();
+        Ok(crate::types::CpuInfo {
+            module_type,
+            serial_number,
+            as_name,
+            copyright,
+            module_name,
+        })
+    }
+
+    /// Read communication processor information (SZL ID 0x0131).
+    ///
+    /// Returns maximum PDU length, connection count, and baud rates.
+    pub async fn get_cp_info(&self) -> Result<crate::types::CpInfo> {
+        let payload = self.read_szl_payload(0x0131, 0x0000).await?;
+        if payload.len() < 14 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mut b = payload;
+        let _block_len = b.get_u16();
+        let _szl_id = b.get_u16();
+        let _szl_ix = b.get_u16();
+        // Next 16 bytes: 4 × u32 big-endian
+        let max_pdu_len = b.get_u32();
+        let max_connections = b.get_u32();
+        let max_mpi_rate = b.get_u32();
+        let max_bus_rate = b.get_u32();
+        Ok(crate::types::CpInfo {
+            max_pdu_len,
+            max_connections,
+            max_mpi_rate,
+            max_bus_rate,
+        })
+    }
+
+    /// Read the rack module list (SZL ID 0x00A0).
+    ///
+    /// Each entry is a 2-byte module type identifier.
+    pub async fn read_module_list(&self) -> Result<Vec<crate::types::ModuleEntry>> {
+        let payload = self.read_szl_payload(0x00A0, 0x0000).await?;
+        if payload.len() < 6 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mut b = payload;
+        let _block_len = b.get_u16();
+        let _szl_id = b.get_u16();
+        let _szl_ix = b.get_u16();
+        let mut modules = Vec::new();
+        while b.remaining() >= 2 {
+            modules.push(crate::types::ModuleEntry {
+                module_type: b.get_u16(),
+            });
+        }
+        Ok(modules)
+    }
+
+    // -- Block list & block info (via SZL + UserData) -------------------------
+
+    /// List all blocks in the PLC grouped by type (SZL 0x0130).
+    ///
+    /// Returns a [`BlockList`] with the total block count and per-type entries.
+    pub async fn list_blocks(&self) -> Result<crate::types::BlockList> {
+        let payload = self.read_szl_payload(0x0130, 0x0000).await?;
+        if payload.len() < 10 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mut b = payload;
+        let _block_len = b.get_u16();
+        let _szl_id = b.get_u16();
+        let _szl_ix = b.get_u16();
+        let total_count = b.get_u32();
+        let mut entries = Vec::new();
+        while b.remaining() >= 4 {
+            entries.push(crate::types::BlockListEntry {
+                block_type: b.get_u16(),
+                count: b.get_u16(),
+            });
+        }
+        Ok(crate::types::BlockList {
+            total_count,
+            entries,
+        })
+    }
+
+    /// Internal: send a UserData block-info request and return the raw response
+    /// data section payload (4-byte envelope skipped).
+    async fn block_info_query(
+        &self,
+        func: u8,
+        block_type: u8,
+        block_number: u16,
+    ) -> Result<Bytes> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+
+        // UserData param for block info (function 0x13 or 0x14):
+        //   [8-byte header] [block_type(1)] [0x00] [block_number(2)]
+        let mut param_buf = BytesMut::with_capacity(12);
+        param_buf.extend_from_slice(&[
+            0x00, 0x01, 0x12, 0x04, func, 0x44, 0x01, 0x00,
+            block_type, 0x00,
+        ]);
+        param_buf.put_u16(block_number);
+
+        Self::send_s7(
+            &mut inner,
+            param_buf.freeze(),
+            Bytes::new(),
+            pdu_ref,
+            PduType::UserData,
+        )
+        .await?;
+
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+
+        // Skip echoed param section
+        if body.remaining() < header.param_len as usize {
+            return Err(Error::UnexpectedResponse);
+        }
+        body.advance(header.param_len as usize);
+
+        // Skip 4-byte data envelope (return_code, transport, data_len)
+        if body.remaining() < 4 {
+            return Err(Error::UnexpectedResponse);
+        }
+        body.advance(4);
+
+        Ok(body.copy_to_bytes(body.remaining()))
+    }
+
+    /// Get detailed information about a block stored on the PLC.
+    ///
+    /// `block_type` should be one of the [`BlockType`](crate::types::BlockType)
+    /// discriminant values (e.g. `0x41` for DB, `0x38` for OB).
+    pub async fn get_ag_block_info(
+        &self,
+        block_type: u8,
+        block_number: u16,
+    ) -> Result<crate::types::BlockInfo> {
+        self.get_block_info(0x13, block_type, block_number).await
+    }
+
+    /// Get detailed block information from the PG perspective.
+    ///
+    /// Same fields as [`get_ag_block_info`](Self::get_ag_block_info) but the
+    /// information is from the programming-device viewpoint.
+    pub async fn get_pg_block_info(
+        &self,
+        block_type: u8,
+        block_number: u16,
+    ) -> Result<crate::types::BlockInfo> {
+        self.get_block_info(0x14, block_type, block_number).await
+    }
+
+    /// Shared implementation for AG and PG block info.
+    async fn get_block_info(
+        &self,
+        func: u8,
+        block_type: u8,
+        block_number: u16,
+    ) -> Result<crate::types::BlockInfo> {
+        let payload = self
+            .block_info_query(func, block_type, block_number)
+            .await?;
+        // Minimum for a valid block info: 6-byte header + block_type + block_number + language + flags + ...
+        if payload.len() < 24 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mut b = payload;
+
+        // Parse block info response (field order derived from S7 protocol):
+        let _blk_type_hi = b.get_u16(); // may echo block type as u16
+        let blk_number = b.get_u16();
+        let language = b.get_u16();
+        let flags = b.get_u16();
+        let mc7_size = b.get_u16();
+        let _size_lo = b.get_u16(); // load-memory size low word
+        let size_ram = b.get_u16();
+        let _size_ro = b.get_u16(); // 0 or RO-size
+        let local_data = b.get_u16();
+        let checksum = b.get_u16();
+        let version = b.get_u16();
+
+        // String fields: author(8), family(8), header(20?), date(8)
+        let author = if b.remaining() >= 8 {
+            String::from_utf8_lossy(&b[..8]).trim_end_matches('\0').trim().to_string()
+        } else { String::new() };
+        b.advance(8.min(b.remaining()));
+
+        let family = if b.remaining() >= 8 {
+            String::from_utf8_lossy(&b[..8]).trim_end_matches('\0').trim().to_string()
+        } else { String::new() };
+        b.advance(8.min(b.remaining()));
+
+        let header = if b.remaining() >= 20 {
+            String::from_utf8_lossy(&b[..20]).trim_end_matches('\0').trim().to_string()
+        } else { String::new() };
+        b.advance(20.min(b.remaining()));
+
+        let date = if b.remaining() >= 8 {
+            String::from_utf8_lossy(&b[..8]).trim_end_matches('\0').trim().to_string()
+        } else { String::new() };
+
+        // Reconstruct total size from the two size halves
+        let size = ((_blk_type_hi as u32) << 16) | (b.len() as u32 & 0xFFFF);
+        let size_u16 = size.min(0xFFFF) as u16;
+
+        Ok(crate::types::BlockInfo {
+            block_type: _blk_type_hi,
+            block_number: blk_number,
+            language,
+            flags,
+            size: size_u16,
+            size_ram,
+            mc7_size,
+            local_data,
+            checksum,
+            version,
+            author,
+            family,
+            header,
+            date,
+        })
+    }
+
+    // -- Security / protection (set/clear password + get protection) ----------
+
+    /// Set a session password for protected PLC access.
+    ///
+    /// The password is obfuscated using the S7 nibble-swap + XOR-0x55 algorithm
+    /// and sent as a Job PDU with function code 0x12.  Passwords longer than
+    /// 8 bytes are truncated.
+    pub async fn set_session_password(&self, password: &str) -> Result<()> {
+        let encrypted = crate::types::encrypt_password(password);
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        let param = Bytes::copy_from_slice(&[0x12, 0x00]);
+        let data = Bytes::copy_from_slice(&encrypted);
+        Self::send_s7(&mut inner, param, data, pdu_ref, PduType::Job).await?;
+        let (header, _body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "set_session_password")?;
+        Ok(())
+    }
+
+    /// Clear the session password on the PLC (function code 0x11).
+    pub async fn clear_session_password(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        let param = Bytes::copy_from_slice(&[0x11, 0x00]);
+        Self::send_s7(&mut inner, param, Bytes::new(), pdu_ref, PduType::Job).await?;
+        let (header, _body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "clear_session_password")?;
+        Ok(())
+    }
+
+    /// Read the current protection level (SZL ID 0x0032, index 0x0004).
+    ///
+    /// Returns the protection scheme identifiers and level;
+    /// `password_set` is `true` when the PLC reports a non-empty password.
+    pub async fn get_protection(&self) -> Result<crate::types::Protection> {
+        let payload = self.read_szl_payload(0x0032, 0x0004).await?;
+        if payload.len() < 14 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mut b = payload;
+        let _block_len = b.get_u16();
+        let _szl_id = b.get_u16();
+        let _szl_ix = b.get_u16();
+        let scheme_szl = b.get_u16();
+        let scheme_module = b.get_u16();
+        let scheme_bus = b.get_u16();
+        let level = b.get_u16();
+        // Next 8 bytes = pass_word field ("PASSWORD" if set, spaces otherwise)
+        let pass_wort = if b.remaining() >= 8 {
+            String::from_utf8_lossy(&b[..8]).trim().to_string()
+        } else {
+            String::new()
+        };
+        let password_set = pass_wort.eq_ignore_ascii_case("PASSWORD");
+        Ok(crate::types::Protection {
+            scheme_szl,
+            scheme_module,
+            scheme_bus,
+            level,
+            password_set,
+        })
+    }
+
+    // -- Block upload / download / delete ------------------------------------
+    //
+    // S7 function 0x1D = Upload  (sub-fn: 0=start, 1=data, 2=end)
+    // S7 function 0x1E = Download (sub-fn: 0=start, 1=data, 2=end)
+    // S7 function 0x1F = Delete
+
+    /// Delete a block from the PLC (S7 function code 0x1F).
+    pub async fn delete_block(&self, block_type: u8, block_number: u16) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        // param: [0x1F, 0x00, block_type, 0x00, block_number(2)]
+        let mut param = BytesMut::with_capacity(6);
+        param.extend_from_slice(&[0x1F, 0x00, block_type, 0x00]);
+        param.put_u16(block_number);
+        Self::send_s7(
+            &mut inner,
+            param.freeze(),
+            Bytes::new(),
+            pdu_ref,
+            PduType::Job,
+        )
+        .await?;
+        let (header, _body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "delete_block")?;
+        Ok(())
+    }
+
+    /// Upload a PLC block via S7 PI-Upload (function 0x1D).
+    ///
+    /// Returns the raw block bytes in Diagra format (20-byte header + payload).
+    /// Use [`BlockData::from_bytes`] to parse the result.
+    pub async fn upload(&self, block_type: u8, block_number: u16) -> Result<Vec<u8>> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+
+        // --- Step 1: Start upload (sub-fn=0x00) ---
+        // param: [0x1D, 0x00, block_type, 0x00, block_number(2)]
+        let mut param = BytesMut::with_capacity(6);
+        param.extend_from_slice(&[0x1D, 0x00, block_type, 0x00]);
+        param.put_u16(block_number);
+        Self::send_s7(
+            &mut inner,
+            param.freeze(),
+            Bytes::new(),
+            pdu_ref,
+            PduType::Job,
+        )
+        .await?;
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "upload_start")?;
+        // Response data: [upload_id(4)][total_len(4)]
+        if body.remaining() < 8 {
+            return Err(Error::UnexpectedResponse);
+        }
+        if body.remaining() >= 2 {
+            body.advance(2); // skip param echo
+        }
+        let upload_id = body.get_u32();
+        let _total_len = body.get_u32();
+
+        // --- Step 2: Loop data chunks (sub-fn=0x01) ---
+        let mut block_data = Vec::new();
+        loop {
+            let chunk_pdu_ref = Self::next_pdu_ref(&mut inner);
+            let mut dparam = BytesMut::with_capacity(6);
+            dparam.extend_from_slice(&[0x1D, 0x01]);
+            dparam.put_u32(upload_id);
+            Self::send_s7(
+                &mut inner,
+                dparam.freeze(),
+                Bytes::new(),
+                chunk_pdu_ref,
+                PduType::Job,
+            )
+            .await?;
+            let (dheader, mut dbody) = Self::recv_s7(&mut inner).await?;
+            check_plc_error(&dheader, "upload_data")?;
+            // Skip param echo
+            if dbody.remaining() >= 2 {
+                dbody.advance(2);
+            }
+            if dbody.is_empty() {
+                break; // no more data
+            }
+            // The first data PDU may have a 4-byte "data header" before the actual block data
+            // (return_code + transport + bit_len).  Skip it.
+            if block_data.is_empty() && dbody.remaining() >= 4 {
+                // Peek at the first byte — if it looks like a return_code (0xFF), skip 4
+                if dbody[0] == 0xFF || dbody[0] == 0x00 {
+                    dbody.advance(4);
+                }
+            }
+            let chunk = dbody.copy_to_bytes(dbody.remaining());
+            block_data.extend_from_slice(&chunk);
+
+            // If this chunk was smaller than PDU size, it's the last one
+            if chunk.len() < inner.connection.pdu_size as usize - 50 {
+                break;
+            }
+            // Safety: prevent infinite loop on broken PLC
+            if block_data.len() > 1024 * 1024 * 4 {
+                // 4 MB
+                return Err(Error::UnexpectedResponse);
+            }
+        }
+
+        // --- Step 3: End upload (sub-fn=0x02) ---
+        let end_pdu_ref = Self::next_pdu_ref(&mut inner);
+        let mut eparam = BytesMut::with_capacity(6);
+        eparam.extend_from_slice(&[0x1D, 0x02]);
+        eparam.put_u32(upload_id);
+        Self::send_s7(
+            &mut inner,
+            eparam.freeze(),
+            Bytes::new(),
+            end_pdu_ref,
+            PduType::Job,
+        )
+        .await?;
+        let (eheader, _ebody) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&eheader, "upload_end")?;
+
+        Ok(block_data)
+    }
+
+    /// Upload a DB block (convenience wrapper around [`upload`](Self::upload)).
+    pub async fn db_get(&self, db_number: u16) -> Result<Vec<u8>> {
+        self.upload(0x41, db_number).await // Block_DB = 0x41
+    }
+
+    /// Download a block to the PLC (S7 function 0x1E).
+    ///
+    /// `data` should be in Diagra format (20-byte header + payload, as returned by
+    /// [`upload`](Self::upload) or built via [`BlockData::to_bytes`]).
+    pub async fn download(&self, block_type: u8, block_number: u16, data: &[u8]) -> Result<()> {
+        let total_len = data.len() as u32;
+        let mut inner = self.inner.lock().await;
+        let pdu_avail = (inner.connection.pdu_size as usize).saturating_sub(50);
+
+        // --- Step 1: Start download (sub-fn=0x00) ---
+        let start_ref = Self::next_pdu_ref(&mut inner);
+        // param: [0x1E, 0x00, block_type, 0x00, block_number(2), total_len(4)]
+        let mut sparam = BytesMut::with_capacity(10);
+        sparam.extend_from_slice(&[0x1E, 0x00, block_type, 0x00]);
+        sparam.put_u16(block_number);
+        sparam.put_u32(total_len);
+
+        // First data chunk
+        let chunk_len = pdu_avail.min(data.len());
+        let first_chunk = Bytes::copy_from_slice(&data[..chunk_len]);
+        Self::send_s7(
+            &mut inner,
+            sparam.freeze(),
+            first_chunk,
+            start_ref,
+            PduType::Job,
+        )
+        .await?;
+
+        let (sheader, mut sbody) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&sheader, "download_start")?;
+        // Response: [download_id(4)]
+        if sbody.remaining() >= 2 {
+            sbody.advance(2); // skip param echo
+        }
+        if sbody.remaining() < 4 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let download_id = sbody.get_u32();
+
+        let mut offset = chunk_len;
+
+        // --- Step 2: Send remaining data chunks (sub-fn=0x01) ---
+        while offset < data.len() {
+            let chunk_ref = Self::next_pdu_ref(&mut inner);
+            let end = (offset + pdu_avail).min(data.len());
+            let chunk = Bytes::copy_from_slice(&data[offset..end]);
+
+            let mut dparam = BytesMut::with_capacity(6);
+            dparam.extend_from_slice(&[0x1E, 0x01]);
+            dparam.put_u32(download_id);
+
+            Self::send_s7(
+                &mut inner,
+                dparam.freeze(),
+                chunk,
+                chunk_ref,
+                PduType::Job,
+            )
+            .await?;
+
+            let (dheader, _dbody) = Self::recv_s7(&mut inner).await?;
+            check_plc_error(&dheader, "download_data")?;
+            offset = end;
+        }
+
+        // --- Step 3: End download (sub-fn=0x02) ---
+        let end_ref = Self::next_pdu_ref(&mut inner);
+        let mut eparam = BytesMut::with_capacity(6);
+        eparam.extend_from_slice(&[0x1E, 0x02]);
+        eparam.put_u32(download_id);
+        Self::send_s7(
+            &mut inner,
+            eparam.freeze(),
+            Bytes::new(),
+            end_ref,
+            PduType::Job,
+        )
+        .await?;
+        let (eheader, _ebody) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&eheader, "download_end")?;
+
+        Ok(())
+    }
+
+    /// Fill a DB with a constant byte value.
+    ///
+    /// Uses [`get_ag_block_info`](Self::get_ag_block_info) to determine the DB
+    /// size, then writes every byte to `value`.
+    pub async fn db_fill(&self, db_number: u16, value: u8) -> Result<()> {
+        let info = self.get_ag_block_info(0x41, db_number).await?; // Block_DB = 0x41
+        let size = info.size as usize;
+        if size == 0 {
+            return Err(Error::PlcError {
+                code: 0,
+                message: format!("DB{db_number} has zero size"),
+            });
+        }
+        let data = vec![value; size];
+        // Write in chunks to respect PDU limits
+        let chunk_size = 240usize; // conservative
+        for offset in (0..size).step_by(chunk_size) {
+            let end = (offset + chunk_size).min(size);
+            self.db_write(db_number, offset as u32, &data[offset..end])
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 fn check_plc_error(header: &S7Header, context: &str) -> Result<()> {
@@ -502,6 +1291,16 @@ impl S7Client<crate::transport::TcpTransport> {
     pub async fn connect(addr: SocketAddr, params: ConnectParams) -> Result<Self> {
         let transport =
             crate::transport::TcpTransport::connect(addr, params.connect_timeout).await?;
+        Self::from_transport(transport, params).await
+    }
+}
+
+impl S7Client<crate::UdpTransport> {
+    /// Connect to a PLC using UDP transport.
+    pub async fn connect_udp(addr: SocketAddr, params: ConnectParams) -> Result<Self> {
+        let transport = crate::UdpTransport::connect(addr)
+            .await
+            .map_err(Error::Io)?;
         Self::from_transport(transport, params).await
     }
 }
@@ -874,5 +1673,167 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(&results[0][..], &[0x11u8; 30][..]);
         assert_eq!(&results[1][..], &[0x22u8; 30][..]);
+    }
+
+    // -- PLC control & status mocks & tests -----------------------------------
+
+    /// Common handshake for control tests: COTP CR → CC, S7 Negotiate.
+    async fn mock_handshake(server_io: &mut (impl AsyncRead + AsyncWrite + Unpin)) {
+        let mut buf = vec![0u8; 4096];
+
+        // COTP CR
+        let _ = server_io.read(&mut buf).await;
+        let cc = CotpPdu::ConnectConfirm { dst_ref: 1, src_ref: 1 };
+        let mut cb = BytesMut::new(); cc.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+
+        // S7 Negotiate
+        let _ = server_io.read(&mut buf).await;
+        let neg = NegotiateResponse { max_amq_calling: 1, max_amq_called: 1, pdu_length: 480 };
+        let mut s7b = BytesMut::new();
+        S7Header {
+            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 1,
+            param_len: 8, data_len: 0, error_class: Some(0), error_code: Some(0),
+        }.encode(&mut s7b);
+        neg.encode(&mut s7b);
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+    }
+
+    /// Mock for simple control commands (plc_stop / plc_hot_start / plc_cold_start).
+    /// `ok` controls whether the mock sends success (error_class=0, error_code=0) or failure.
+    async fn mock_plc_control(
+        mut server_io: tokio::io::DuplexStream,
+        ok: bool,
+    ) {
+        let mut buf = vec![0u8; 4096];
+        mock_handshake(&mut server_io).await;
+
+        // Control request — consume
+        let _ = server_io.read(&mut buf).await;
+
+        // AckData response
+        let (ec, ecd) = if ok { (0u8, 0u8) } else { (0x81u8, 0x04u8) };
+        let mut s7b = BytesMut::new();
+        S7Header {
+            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 2,
+            param_len: 0, data_len: 0,
+            error_class: Some(ec), error_code: Some(ecd),
+        }.encode(&mut s7b);
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plc_stop_succeeds() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_control(server_io, true));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        client.plc_stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plc_hot_start_succeeds() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_control(server_io, true));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        client.plc_hot_start().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plc_cold_start_succeeds() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_control(server_io, true));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        client.plc_cold_start().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plc_stop_rejected_returns_error() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_control(server_io, false));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let result = client.plc_stop().await;
+        assert!(result.is_err());
+    }
+
+    /// Mock for get_plc_status: sends back `status_byte` in the data section.
+    async fn mock_plc_status(
+        mut server_io: tokio::io::DuplexStream,
+        status_byte: u8,
+    ) {
+        let mut buf = vec![0u8; 4096];
+        mock_handshake(&mut server_io).await;
+
+        // GetPlcStatus request — consume
+        let _ = server_io.read(&mut buf).await;
+
+        // Response: param echo [0x31, 0x00] + status byte
+        let data = &[0x31u8, 0x00, status_byte]; // param(2) + data(1)
+        let data_len = data.len() as u16;
+        let mut s7b = BytesMut::new();
+        S7Header {
+            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 2,
+            param_len: 2, data_len,
+            error_class: Some(0), error_code: Some(0),
+        }.encode(&mut s7b);
+        s7b.extend_from_slice(data);
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_plc_status_returns_run() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_status(server_io, 0x08));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let status = client.get_plc_status().await.unwrap();
+        assert_eq!(status, crate::types::PlcStatus::Run);
+    }
+
+    #[tokio::test]
+    async fn get_plc_status_returns_stop() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_status(server_io, 0x04));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let status = client.get_plc_status().await.unwrap();
+        assert_eq!(status, crate::types::PlcStatus::Stop);
+    }
+
+    #[tokio::test]
+    async fn get_plc_status_returns_unknown() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_status(server_io, 0x00));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let status = client.get_plc_status().await.unwrap();
+        assert_eq!(status, crate::types::PlcStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn get_plc_status_unknown_byte_returns_error() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_status(server_io, 0xFF));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let result = client.get_plc_status().await;
+        assert!(result.is_err());
     }
 }

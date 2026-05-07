@@ -44,14 +44,20 @@ impl SzlRequest {
 }
 
 impl SzlResponse {
+    /// Decode an SZL data block from a UserData SZL response.
+    ///
+    /// Wire format:
+    /// ```text
+    /// [block_len: 2] [szl_id: 2] [szl_index: 2] [data...]
+    /// ```
     pub fn decode(buf: &mut Bytes) -> Result<Self, ProtoError> {
-        if buf.len() < 12 {
+        if buf.len() < 6 {
             return Err(ProtoError::BufferTooShort {
-                need: 12,
+                need: 6,
                 have: buf.len(),
             });
         }
-        buf.advance(8); // skip param header
+        let _block_len = buf.get_u16(); // length of remaining data in this block
         let szl_id = buf.get_u16();
         let szl_index = buf.get_u16();
         let data = buf.split_to(buf.len());
@@ -95,8 +101,10 @@ mod tests {
 
     #[test]
     fn szl_response_decode_with_data() {
-        // 8-byte header + 2-byte szl_id + 2-byte szl_index + 4 bytes data
-        let mut raw = vec![0x00u8, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00];
+        // SZL data block: block_len(2) + szl_id(2) + szl_index(2) + data(4)
+        // block_len = 2+2+4 = 8
+        let mut raw: Vec<u8> = vec![];
+        raw.extend_from_slice(&[0x00, 0x08]); // block_len = 8
         raw.extend_from_slice(&[0x00, 0x11]); // szl_id
         raw.extend_from_slice(&[0x00, 0x00]); // szl_index
         raw.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // data
@@ -105,6 +113,12 @@ mod tests {
         assert_eq!(resp.szl_id, 0x0011);
         assert_eq!(resp.szl_index, 0x0000);
         assert_eq!(resp.data.as_ref(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn szl_response_decode_truncated_returns_err() {
+        let mut b = Bytes::from_static(b"\x00\x08\x00\x11"); // only 4 bytes, need 6
+        assert!(SzlResponse::decode(&mut b).is_err());
     }
 
     #[test]

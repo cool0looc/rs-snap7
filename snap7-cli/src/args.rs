@@ -47,16 +47,32 @@ pub enum OutputFormat {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Read bytes from a data block
     Read(ReadArgs),
+    /// Write hex bytes to a data block
     Write(WriteArgs),
+    /// Read/write typed tags (e.g. DB1,REAL4)
     Tag(TagArgs),
+    /// Block operations: list, info, upload
     Block(BlockArgs),
+    /// Query SZL (system status list)
     Szl(SzlArgs),
+    /// Quick connectivity test
     Diag,
+    /// Watch a data block for changes
     Watch(WatchArgs),
+    /// PLC control: stop, hotstart, coldstart, status
+    PlcControl(PlcControlArgs),
+    /// PLC information: order-code, cpu-info, cp-info
+    Info(InfoArgs),
+    /// Set or clear the session password
+    Password(PasswordArgs),
     #[cfg(feature = "opcua")]
+    /// Start the OPC-UA gateway server
     Serve(ServeArgs),
 }
+
+// --- Read / Write ---
 
 #[derive(clap::Args, Debug)]
 pub struct ReadArgs {
@@ -78,6 +94,8 @@ pub struct WriteArgs {
     pub data: String,
 }
 
+// --- Tag ---
+
 #[derive(clap::Args, Debug)]
 pub struct TagArgs {
     #[command(subcommand)]
@@ -90,6 +108,8 @@ pub enum TagAction {
     Write { tag: String, value: String },
 }
 
+// --- Block ---
+
 #[derive(clap::Args, Debug)]
 pub struct BlockArgs {
     #[command(subcommand)]
@@ -98,6 +118,16 @@ pub struct BlockArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum BlockAction {
+    /// List all blocks grouped by type
+    List,
+    /// Show detailed info about a block
+    Info {
+        #[arg(long)]
+        r#type: String,
+        #[arg(long)]
+        number: u16,
+    },
+    /// Upload a block and save to file (Diagra format)
     Upload {
         #[arg(long)]
         r#type: String,
@@ -106,8 +136,9 @@ pub enum BlockAction {
         #[arg(long)]
         out: String,
     },
-    List,
 }
+
+// --- SZL ---
 
 #[derive(clap::Args, Debug)]
 pub struct SzlArgs {
@@ -117,33 +148,83 @@ pub struct SzlArgs {
     pub index: u16,
 }
 
+// --- Watch ---
+
 #[derive(clap::Args, Debug)]
 pub struct WatchArgs {
-    /// Data block number
     #[arg(long)]
     pub db: u16,
-
-    /// Byte offset within the data block
     #[arg(long, default_value = "0")]
     pub offset: u32,
-
-    /// Number of bytes to read
     #[arg(long)]
     pub size: u16,
-
-    /// Poll interval in milliseconds
     #[arg(long, default_value = "1000")]
     pub interval_ms: u64,
-
-    /// Only print when the value changes
     #[arg(long, default_value_t = false)]
     pub changes_only: bool,
 }
 
+// --- PlcControl ---
+
+#[derive(clap::Args, Debug)]
+pub struct PlcControlArgs {
+    #[command(subcommand)]
+    pub action: PlcAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlcAction {
+    /// Stop the PLC
+    Stop,
+    /// Warm restart (retains DBs)
+    HotStart,
+    /// Cold restart (clears DBs)
+    ColdStart,
+    /// Read PLC status (RUN / STOP)
+    Status,
+}
+
+// --- Info ---
+
+#[derive(clap::Args, Debug)]
+pub struct InfoArgs {
+    #[command(subcommand)]
+    pub action: InfoAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InfoAction {
+    /// Read PLC order code (e.g. 6ES7 317-2EK14-0AB0)
+    OrderCode,
+    /// Read CPU detailed info
+    CpuInfo,
+    /// Read communications processor info
+    CpInfo,
+    /// Read module list
+    ModuleList,
+}
+
+// --- Password ---
+
+#[derive(clap::Args, Debug)]
+pub struct PasswordArgs {
+    #[command(subcommand)]
+    pub action: PasswordAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PasswordAction {
+    /// Set session password
+    Set { password: String },
+    /// Clear session password
+    Clear,
+}
+
+// --- Serve ---
+
 #[cfg(feature = "opcua")]
 #[derive(clap::Args, Debug)]
 pub struct ServeArgs {
-    /// Path to gateway TOML config file
     #[arg(short, long, default_value = "gateway.toml")]
     pub config: std::path::PathBuf,
 }

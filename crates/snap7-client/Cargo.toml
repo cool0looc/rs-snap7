@@ -1,6 +1,6 @@
 [package]
 name = "snap7-client"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Async Rust client for Siemens S7 PLCs over ISO-on-TCP (S7Comm and S7CommPlus)"
 license = "MIT"

@@ -3,20 +3,36 @@ use crate::proto::s7commplus::data::DataArea;
 use crate::proto::s7commplus::session::{FC_GET_MULTI_VAR, FC_SET_MULTI_VAR, OPCODE_REQUEST};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-#[derive(Debug)]
-pub struct GetVarRequest {
-    pub seqnum: u16,
-    pub session_id: u32,
+/// A single variable to read in a multi-var request.
+#[derive(Debug, Clone)]
+pub struct VarSpec {
     pub crc: u32,
     pub lid: u32,
 }
 
-impl GetVarRequest {
+/// A single variable in a multi-var response.
+#[derive(Debug, Clone)]
+pub struct VarResult {
+    pub return_code: u8,
+    pub value: Bytes,
+}
+
+/// Request to read multiple variables in one PDU.
+#[derive(Debug)]
+pub struct GetMultiVarRequest {
+    pub seqnum: u16,
+    pub session_id: u32,
+    pub items: Vec<VarSpec>,
+}
+
+impl GetMultiVarRequest {
     pub fn encode(&self, buf: &mut BytesMut) {
-        let mut payload = BytesMut::with_capacity(9);
-        payload.put_u8(0x01); // one variable
-        payload.put_u32(self.crc);
-        payload.put_u32(self.lid);
+        let mut payload = BytesMut::new();
+        payload.put_u8(self.items.len() as u8);
+        for item in &self.items {
+            payload.put_u32(item.crc);
+            payload.put_u32(item.lid);
+        }
         DataArea {
             opcode: OPCODE_REQUEST,
             function_code: FC_GET_MULTI_VAR,
@@ -29,6 +45,53 @@ impl GetVarRequest {
     }
 }
 
+/// Response from a multi-variable read.
+#[derive(Debug)]
+pub struct GetMultiVarResponse {
+    pub items: Vec<VarResult>,
+}
+
+impl GetMultiVarResponse {
+    pub fn decode(buf: &mut Bytes, item_count: usize) -> Result<Self, ProtoError> {
+        let da = DataArea::decode(buf)?;
+        let mut payload = da.payload;
+        let mut items = Vec::with_capacity(item_count);
+        for _ in 0..item_count {
+            if payload.remaining() < 3 {
+                return Err(ProtoError::BufferTooShort { need: 3, have: payload.remaining() });
+            }
+            let return_code = payload.get_u8();
+            let data_len = payload.get_u16() as usize;
+            if payload.remaining() < data_len {
+                return Err(ProtoError::BufferTooShort { need: data_len, have: payload.remaining() });
+            }
+            let value = payload.copy_to_bytes(data_len);
+            items.push(VarResult { return_code, value });
+        }
+        Ok(GetMultiVarResponse { items })
+    }
+}
+
+// Legacy single-var request (wraps GetMultiVarRequest with count=1)
+#[derive(Debug)]
+pub struct GetVarRequest {
+    pub seqnum: u16,
+    pub session_id: u32,
+    pub crc: u32,
+    pub lid: u32,
+}
+
+impl GetVarRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let req = GetMultiVarRequest {
+            seqnum: self.seqnum,
+            session_id: self.session_id,
+            items: vec![VarSpec { crc: self.crc, lid: self.lid }],
+        };
+        req.encode(buf);
+    }
+}
+
 #[derive(Debug)]
 pub struct GetVarResponse {
     pub return_code: u8,
@@ -37,30 +100,55 @@ pub struct GetVarResponse {
 
 impl GetVarResponse {
     pub fn decode(buf: &mut Bytes) -> Result<Self, ProtoError> {
-        let da = DataArea::decode(buf)?;
-        let mut payload = da.payload;
-        if payload.is_empty() {
+        let multi = GetMultiVarResponse::decode(buf, 1)?;
+        if multi.items.is_empty() {
             return Err(ProtoError::BufferTooShort { need: 3, have: 0 });
         }
-        let return_code = payload.get_u8();
-        if payload.len() < 2 {
-            return Err(ProtoError::BufferTooShort {
-                need: 2,
-                have: payload.len(),
-            });
-        }
-        let data_len = payload.get_u16() as usize;
-        if payload.len() < data_len {
-            return Err(ProtoError::BufferTooShort {
-                need: data_len,
-                have: payload.len(),
-            });
-        }
-        let value = payload.copy_to_bytes(data_len);
-        Ok(GetVarResponse { return_code, value })
+        Ok(GetVarResponse {
+            return_code: multi.items[0].return_code,
+            value: multi.items[0].value.clone(),
+        })
     }
 }
 
+/// Request to write multiple variables in one PDU.
+#[derive(Debug)]
+pub struct SetMultiVarRequest {
+    pub seqnum: u16,
+    pub session_id: u32,
+    pub items: Vec<SetVarItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetVarItem {
+    pub crc: u32,
+    pub lid: u32,
+    pub value: Bytes,
+}
+
+impl SetMultiVarRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut payload = BytesMut::new();
+        payload.put_u8(self.items.len() as u8);
+        for item in &self.items {
+            payload.put_u32(item.crc);
+            payload.put_u32(item.lid);
+            payload.put_u16(item.value.len() as u16);
+            payload.put_slice(&item.value);
+        }
+        DataArea {
+            opcode: OPCODE_REQUEST,
+            function_code: FC_SET_MULTI_VAR,
+            seqnum: self.seqnum,
+            session_id: self.session_id,
+            transport_flags: 0,
+            payload: payload.freeze(),
+        }
+        .encode(buf);
+    }
+}
+
+// Legacy single-var request
 #[derive(Debug)]
 pub struct SetVarRequest {
     pub seqnum: u16,
@@ -72,21 +160,16 @@ pub struct SetVarRequest {
 
 impl SetVarRequest {
     pub fn encode(&self, buf: &mut BytesMut) {
-        let mut payload = BytesMut::with_capacity(9 + 2 + self.value.len());
-        payload.put_u8(0x01); // one variable
-        payload.put_u32(self.crc);
-        payload.put_u32(self.lid);
-        payload.put_u16(self.value.len() as u16);
-        payload.put_slice(&self.value);
-        DataArea {
-            opcode: OPCODE_REQUEST,
-            function_code: FC_SET_MULTI_VAR,
+        let req = SetMultiVarRequest {
             seqnum: self.seqnum,
             session_id: self.session_id,
-            transport_flags: 0,
-            payload: payload.freeze(),
-        }
-        .encode(buf);
+            items: vec![SetVarItem {
+                crc: self.crc,
+                lid: self.lid,
+                value: self.value.clone(),
+            }],
+        };
+        req.encode(buf);
     }
 }
 
