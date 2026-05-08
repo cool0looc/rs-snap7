@@ -17,6 +17,15 @@ pub async fn run(client: &S7Client<TcpTransport>, args: BlockArgs) -> Result<()>
                 println!("  {} (0x{:04X}): {} blocks", label, e.block_type, e.count);
             }
         }
+        BlockAction::Numbers { r#type } => {
+            let bt = parse_block_type(&r#type)?;
+            let nums = client.list_blocks_of_type(bt).await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("{} blocks of type {}:", nums.len(), r#type.to_uppercase());
+            for n in &nums {
+                println!("  {}{}", r#type.to_uppercase(), n);
+            }
+        }
         BlockAction::Info { r#type, number } => {
             let bt = parse_block_type(&r#type)?;
             let info = client.get_ag_block_info(bt, number).await?;

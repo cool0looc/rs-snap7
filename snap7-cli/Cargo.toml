@@ -1,6 +1,6 @@
 [package]
 name = "snap7-cli"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "CLI tool for communicating with Siemens S7 PLCs — read/write data blocks, watch tags, upload blocks, query SZL"
 license = "MIT"

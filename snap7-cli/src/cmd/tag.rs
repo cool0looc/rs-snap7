@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
+use snap7_client::proto::s7::header::{Area, TransportSize};
 use snap7_client::{tag::parse_tag, transport::TcpTransport, S7Client};
-use snap7_client::proto::s7::header::TransportSize;
 
 use crate::args::{OutputFormat, TagAction, TagArgs};
 
@@ -13,30 +13,68 @@ pub async fn run(
     match args.action {
         TagAction::Read { tag } => {
             let addr = parse_tag(&tag).map_err(|e| anyhow::anyhow!("{}", e))?;
-            let size = transport_size_bytes(addr.transport);
-            let data = client
-                .db_read(addr.db_number, addr.byte_offset, size)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let data = read_tag(client, &addr).await?;
             println!("{}", decode_value(&data, addr.transport));
         }
         TagAction::Write { tag, value } => {
             let addr = parse_tag(&tag).map_err(|e| anyhow::anyhow!("{}", e))?;
             let data = encode_value(&value, addr.transport)?;
-            client
-                .db_write(addr.db_number, addr.byte_offset, &data)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            write_tag(client, &addr, &data).await?;
             println!("ok");
         }
     }
     Ok(())
 }
 
+async fn read_tag(
+    client: &S7Client<snap7_client::transport::TcpTransport>,
+    addr: &snap7_client::tag::TagAddress,
+) -> Result<Bytes> {
+    use snap7_client::proto::s7::header::Area::*;
+    match addr.area {
+        DataBlock => client
+            .db_read(addr.db_number, addr.byte_offset, transport_size_bytes(addr.transport))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e)),
+        Timer | Counter | Marker | ProcessInput | ProcessOutput | InstanceDB | LocalData => client
+            .read_area(
+                addr.area,
+                addr.db_number,
+                addr.byte_offset,
+                addr.element_count,
+                addr.transport,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e)),
+    }
+}
+
+async fn write_tag(
+    client: &S7Client<snap7_client::transport::TcpTransport>,
+    addr: &snap7_client::tag::TagAddress,
+    data: &[u8],
+) -> Result<()> {
+    match addr.area {
+        Area::DataBlock => client
+            .db_write(addr.db_number, addr.byte_offset, data)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e)),
+        _ => client
+            .write_area(addr.area, addr.db_number, addr.byte_offset, addr.transport, data)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e)),
+    }
+}
+
 fn transport_size_bytes(ts: TransportSize) -> u16 {
     match ts {
         TransportSize::Bit | TransportSize::Byte | TransportSize::Char => 1,
-        TransportSize::Word | TransportSize::Int | TransportSize::S5Time | TransportSize::Date => 2,
+        TransportSize::Word
+        | TransportSize::Int
+        | TransportSize::S5Time
+        | TransportSize::Date
+        | TransportSize::Timer
+        | TransportSize::Counter => 2,
         TransportSize::DWord
         | TransportSize::DInt
         | TransportSize::Real

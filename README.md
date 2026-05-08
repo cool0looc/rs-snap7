@@ -2,7 +2,7 @@
 
 Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates with S7-300/400/1200/1500 PLCs over ISO-on-TCP without any native C dependency.
 
-> **Status:** v0.1.4 — functional, pre-1.0. API may change.
+> **Status:** v0.1.6 — functional, pre-1.0. API may change.
 
 ## Features
 
@@ -14,14 +14,14 @@ Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates w
 | **UDP transport** | ✅ |
 | **Connection pool** | ✅ |
 | **Multi-read / multi-write** with automatic PDU batching | ✅ |
-| **PLC control** — stop, hot-start, cold-start, status | ✅ |
+| **PLC control** — stop, hot-start, cold-start, status (via SZL 0x0424) | ✅ |
 | **PLC information** — order code, CPU info, CP info, module list | ✅ |
-| **Block operations** — list, info, upload, download, delete, fill | ✅ |
+| **Block operations** — list, numbers, info, upload, download, delete, fill | ✅ |
 | **Session password** — set, clear, read protection level | ✅ |
 | **SZL queries** — system status list | ✅ |
 | **PLC clock read** | ✅ |
 | **Copy RAM → ROM, compress memory** | ✅ |
-| **CLI** — typed tags, multi-format output (text/json/csv) | ✅ |
+| **CLI** — typed tags (DB/Merker/Timer/Counter), multi-format output (text/json/csv) | ✅ |
 | **OPC-UA gateway** with subscription support | ✅ |
 | **In-process PLC simulator** with data store, callbacks, CPU state | ✅ |
 
@@ -77,21 +77,34 @@ snap7 -H 192.168.1.100 read --db 1 --offset 0 --size 16
 # Write bytes (hex) to DB2 at offset 4
 snap7 -H 192.168.1.100 write --db 2 --offset 4 --data DEADBEEF
 
-# Read a typed tag
+# Read a typed tag (DB)
 snap7 -H 192.168.1.100 tag read DB1,REAL0
 snap7 -H 192.168.1.100 tag read DB70,332.0       # bit access
+snap7 -H 192.168.1.100 tag read DB170,REAL262     # comma separator
+snap7 -H 192.168.1.100 tag read DB170.REAL262     # dot separator (same)
+
+# Read Merker (M), Timer (T), Counter (C) tags
+snap7 -H 192.168.1.100 tag read MB10              # Merker byte
+snap7 -H 192.168.1.100 tag read MW20              # Merker word
+snap7 -H 192.168.1.100 tag read MD4               # Merker dword
+snap7 -H 192.168.1.100 tag read M10.3             # Merker bit (byte 10, bit 3)
+snap7 -H 192.168.1.100 tag read MX5.7             # Merker bit (MX prefix)
+snap7 -H 192.168.1.100 tag read T5                # Timer 5
+snap7 -H 192.168.1.100 tag read C3                # Counter 3
 
 # Write a typed tag
 snap7 -H 192.168.1.100 tag write DB1,REAL0 3.14
 snap7 -H 192.168.1.100 tag write DB10,DINT0 42
+snap7 -H 192.168.1.100 tag write MB10 255
 
 # Watch a tag (poll every 500 ms, print on change only)
 snap7 -H 192.168.1.100 watch --db 1 --offset 0 --size 4 --interval-ms 500 --changes-only
 
 # Block operations
 snap7 -H 192.168.1.100 block list
-snap7 -H 192.168.1.100 block info --type OB --number 1
-snap7 -H 192.168.1.100 block upload --type OB --number 1 --out ob1.bin
+snap7 -H 192.168.1.100 block numbers --type DB
+snap7 -H 192.168.1.100 block info --type DB --number 1
+snap7 -H 192.168.1.100 block upload --type DB --number 1 --out db1.bin
 
 # Query SZL (system status list)
 snap7 -H 192.168.1.100 szl --id 0x0011 --index 0
@@ -106,6 +119,7 @@ snap7 -H 192.168.1.100 plc-control coldstart
 snap7 -H 192.168.1.100 info order-code
 snap7 -H 192.168.1.100 info cpu-info
 snap7 -H 192.168.1.100 info cp-info
+snap7 -H 192.168.1.100 info module-list
 
 # Session password
 snap7 -H 192.168.1.100 password set mypass
@@ -141,20 +155,41 @@ snap7 -H 127.0.0.1 -p 10200 read --db 1 --offset 0 --size 4
 
 ### Tag address syntax
 
+DB tags require a comma (or dot) separator between the DB number and the type:
+
 ```
 DB<n>,<type><offset>
-DB<n>,<offset>.<bit>
+DB<n>.<type><offset>    # dot separator, same result
+DB<n>,<offset>.<bit>    # bit access
 ```
 
-| Type | Width | Example |
-|---|---|---|
-| `REAL` | 4 bytes | `DB1,REAL0` |
-| `DINT` | 4 bytes | `DB1,DINT4` |
-| `DWORD` | 4 bytes | `DB1,DWORD4` |
-| `INT` | 2 bytes | `DB1,INT8` |
-| `WORD` | 2 bytes | `DB1,WORD8` |
-| `BYTE` | 1 byte | `DB1,BYTE10` |
-| bit | 1 bit | `DB1,332.0` |
+Merker, Timer, and Counter tags are single-part — no separator needed:
+
+```
+M<byte>.<bit>           # Merker bit  (e.g. M10.3)
+MX<byte>.<bit>          # Merker bit  (MX prefix)
+MB<byte>                # Merker byte (e.g. MB10)
+MW<byte>                # Merker word (e.g. MW20)
+MD<byte>                # Merker dword(e.g. MD4)
+T<n>                    # Timer       (e.g. T5)
+C<n>                    # Counter     (e.g. C3)
+```
+
+| Area | Type | Width | Example |
+|---|---|---|---|
+| DB | `REAL` | 4 bytes | `DB1,REAL0` |
+| DB | `DINT` | 4 bytes | `DB1,DINT4` |
+| DB | `DWORD` | 4 bytes | `DB1,DWORD4` |
+| DB | `INT` | 2 bytes | `DB1,INT8` |
+| DB | `WORD` | 2 bytes | `DB1,WORD8` |
+| DB | `BYTE` | 1 byte | `DB1,BYTE10` |
+| DB | bit | 1 bit | `DB1,332.0` |
+| Merker | bit | 1 bit | `M10.3` / `MX10.3` |
+| Merker | byte | 1 byte | `MB10` |
+| Merker | word | 2 bytes | `MW20` |
+| Merker | dword | 4 bytes | `MD4` |
+| Timer | S5Time | 2 bytes | `T5` |
+| Counter | BCD | 2 bytes | `C3` |
 
 ### Output formats
 
@@ -196,11 +231,11 @@ async fn main() -> anyhow::Result<()> {
     let client = S7Client::<TcpTransport>::connect(addr, params).await?;
 
     // Read 4 bytes from DB1 offset 0
-    let data = client.read_db(1, 0, 4).await?;
+    let data = client.db_read(1, 0, 4).await?;
     println!("{data:?}");
 
     // Write
-    client.write_db(1, 0, &[0xDE, 0xAD, 0xBE, 0xEF]).await?;
+    client.db_write(1, 0, &[0xDE, 0xAD, 0xBE, 0xEF]).await?;
 
     // Multi-read (one PDU, automatic batching)
     use snap7_client::MultiReadItem;
@@ -218,10 +253,16 @@ async fn main() -> anyhow::Result<()> {
     ];
     client.write_multi_vars(&items).await?;
 
-    // Absolute area read/write (any area, not just DB)
-    use snap7_client::proto::s7::header::Area;
-    let data = client.ab_read(Area::Merker, 0, 0, 4).await?;
-    client.ab_write(Area::ProcessOutputs, 0, 0, &[0x00]).await?;
+    // Read/write any area with explicit transport size
+    use snap7_client::proto::s7::header::{Area, TransportSize};
+    let data = client.read_area(Area::Marker, 0, 10, 1, TransportSize::Byte).await?;
+    let data = client.read_area(Area::Timer, 0, 5, 1, TransportSize::Timer).await?;
+    let data = client.read_area(Area::Counter, 0, 3, 1, TransportSize::Counter).await?;
+    client.write_area(Area::Marker, 0, 10, TransportSize::Byte, &[0xFF]).await?;
+
+    // Absolute area read/write (byte transport, any area)
+    let data = client.ab_read(Area::Marker, 0, 0, 4).await?;
+    client.ab_write(Area::ProcessOutput, 0, 0, &[0x00]).await?;
 
     Ok(())
 }
@@ -263,8 +304,9 @@ async fn main() -> anyhow::Result<()> {
 ### PLC control & information
 
 ```rust
-// Read PLC status (RUN / STOP)
+// Read PLC status via SZL 0x0424 (works on S7-300/400/1200/1500)
 let status = client.get_plc_status().await?;
+println!("{status:?}"); // Run | Stop | Unknown
 
 // Control the PLC
 client.plc_stop().await?;
@@ -279,6 +321,7 @@ println!("Order code: {}", oc.code);
 let ci = client.get_cpu_info().await?;
 println!("Module: {}", ci.module_type);
 println!("Serial: {}", ci.serial_number);
+println!("AS name: {}", ci.as_name);
 
 // Read CP info (max PDU size, connections, baud rates)
 let cp = client.get_cp_info().await?;
@@ -290,19 +333,22 @@ let modules = client.read_module_list().await?;
 ### Block operations
 
 ```rust
-// List all blocks
+// List all blocks grouped by type
 let list = client.list_blocks().await?;
 for entry in &list.entries {
     println!("Type 0x{:04X}: {} blocks", entry.block_type, entry.count);
 }
 
+// List all block numbers of a given type
+let numbers = client.list_blocks_of_type(0x41).await?; // all DBs
+for n in &numbers { println!("DB{n}"); }
+
 // Get detailed block info
 let info = client.get_ag_block_info(0x41, 1).await?; // DB 1
-println!("Size: {} bytes", info.size);
-println!("Author: {}", info.author);
+println!("Size: {} bytes, Author: {}", info.size, info.author);
 
 // Upload a block (Diagra format)
-let data = client.upload(0x41, 1).await?; // DB 1
+let data = client.upload(0x41, 1).await?;
 if let Some(bd) = snap7_client::BlockData::from_bytes(&data) {
     println!("Uploaded block {} bytes", bd.total_length);
 }
@@ -315,6 +361,28 @@ client.delete_block(0x41, 1).await?;
 
 // Fill a DB with constant value
 client.db_fill(1, 0x00).await?;
+```
+
+### Typed tag parsing
+
+```rust
+use snap7_client::tag::parse_tag;
+
+// DB tags
+let tag = parse_tag("DB1,REAL4")?;     // REAL at byte 4
+let tag = parse_tag("DB1.REAL4")?;     // dot separator, same result
+let tag = parse_tag("DB70,332.0")?;    // bit 0 of byte 332
+
+// Merker tags (single-part, no separator)
+let tag = parse_tag("MB10")?;          // Merker byte at offset 10
+let tag = parse_tag("MW20")?;          // Merker word at offset 20
+let tag = parse_tag("MD4")?;           // Merker dword at offset 4
+let tag = parse_tag("M10.3")?;         // Merker bit: byte 10, bit 3
+let tag = parse_tag("MX5.7")?;         // Merker bit: byte 5, bit 7
+
+// Timer and Counter (element-index addressing)
+let tag = parse_tag("T5")?;            // Timer 5
+let tag = parse_tag("C3")?;            // Counter 3
 ```
 
 ### Session password & protection
@@ -361,7 +429,7 @@ let config = PoolConfig { max_size: 4, ..Default::default() };
 
 let pool = S7Pool::new(addr, params, config);
 let client = pool.get().await?;
-client.read_db(1, 0, 4).await?;
+client.db_read(1, 0, 4).await?;
 ```
 
 ### Embed a test server

@@ -162,6 +162,11 @@ pub struct BlockArgs {
 pub enum BlockAction {
     /// List all blocks grouped by type
     List,
+    /// List all block numbers of a given type
+    Numbers {
+        #[arg(long)]
+        r#type: String,
+    },
     /// Show detailed info about a block
     Info {
         #[arg(long)]

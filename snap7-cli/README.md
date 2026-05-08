@@ -1,6 +1,6 @@
 # snap7-cli
 
-Command-line tool for communicating with Siemens S7 PLCs. Pure Rust — no FFI, no native C dependency. Read/write data blocks, watch tags, upload blocks, query SZL, and run an OPC-UA gateway — all from the terminal.
+Command-line tool for communicating with Siemens S7 PLCs. Pure Rust — no FFI, no native C dependency. Read/write data blocks, watch tags, query SZL, upload blocks, and run an OPC-UA gateway — all from the terminal.
 
 Part of the [rs-snap7](https://github.com/cool0looc/rs-snap7) workspace.
 
@@ -44,6 +44,7 @@ snap7 [FLAGS] <SUBCOMMAND>
 
 ```bash
 snap7 -H 192.168.1.100 read --db 1 --offset 0 --size 16
+snap7 -H 192.168.1.100 read --db 1 --offset 0 --size 4 --area merker
 ```
 
 ### write — raw DB write (hex bytes)
@@ -54,10 +55,27 @@ snap7 -H 192.168.1.100 write --db 2 --offset 4 --data DEADBEEF
 
 ### tag — typed read/write
 
+Supports DB, Merker (M), Timer (T), and Counter (C) tags:
+
 ```bash
+# DB tags
 snap7 -H 192.168.1.100 tag read DB1,REAL0
-snap7 -H 192.168.1.100 tag read DB70,332.0     # bit access
+snap7 -H 192.168.1.100 tag read DB170.REAL262    # dot separator
+snap7 -H 192.168.1.100 tag read DB70,332.0       # bit access
 snap7 -H 192.168.1.100 tag write DB1,REAL0 3.14
+snap7 -H 192.168.1.100 tag write DB10,DINT0 42
+
+# Merker tags
+snap7 -H 192.168.1.100 tag read MB10             # byte
+snap7 -H 192.168.1.100 tag read MW20             # word
+snap7 -H 192.168.1.100 tag read MD4              # dword
+snap7 -H 192.168.1.100 tag read M10.3            # bit (byte 10, bit 3)
+snap7 -H 192.168.1.100 tag read MX5.7            # bit (MX prefix)
+snap7 -H 192.168.1.100 tag write MB10 255
+
+# Timer and Counter
+snap7 -H 192.168.1.100 tag read T5               # Timer 5
+snap7 -H 192.168.1.100 tag read C3               # Counter 3
 ```
 
 ### watch — poll a DB region
@@ -67,17 +85,54 @@ snap7 -H 192.168.1.100 watch --db 1 --offset 0 --size 4 \
     --interval-ms 500 --changes-only
 ```
 
-### block — upload or list blocks
+### block — block operations
 
 ```bash
-snap7 -H 192.168.1.100 block upload --type OB --number 1 --out ob1.bin
+# List all blocks grouped by type
 snap7 -H 192.168.1.100 block list
+
+# List all block numbers of a given type
+snap7 -H 192.168.1.100 block numbers --type DB
+snap7 -H 192.168.1.100 block numbers --type OB
+
+# Show detailed info for a block
+snap7 -H 192.168.1.100 block info --type DB --number 1
+
+# Upload a block to file
+snap7 -H 192.168.1.100 block upload --type DB --number 1 --out db1.bin
 ```
 
 ### szl — query system status list
 
 ```bash
-snap7 -H 192.168.1.100 szl --id 0x0011 --index 0
+snap7 -H 192.168.1.100 szl --id 0x0011 --index 0   # order code
+snap7 -H 192.168.1.100 szl --id 0x001C --index 0   # CPU info
+snap7 -H 192.168.1.100 szl --id 0x0424 --index 0   # CPU status
+```
+
+### plc-control — PLC state management
+
+```bash
+snap7 -H 192.168.1.100 plc-control status      # RUN / STOP (via SZL 0x0424)
+snap7 -H 192.168.1.100 plc-control stop
+snap7 -H 192.168.1.100 plc-control hotstart    # warm restart
+snap7 -H 192.168.1.100 plc-control coldstart   # cold restart
+```
+
+### info — PLC information
+
+```bash
+snap7 -H 192.168.1.100 info order-code         # e.g. "6ES7 317-2EK14-0AB0"
+snap7 -H 192.168.1.100 info cpu-info           # module type, serial, AS name
+snap7 -H 192.168.1.100 info cp-info            # PDU size, connections, baud rates
+snap7 -H 192.168.1.100 info module-list        # installed modules
+```
+
+### password — session password
+
+```bash
+snap7 -H 192.168.1.100 password set mypass
+snap7 -H 192.168.1.100 password clear
 ```
 
 ### diag — connection diagnostics
@@ -117,20 +172,36 @@ snap7 -H 127.0.0.1 -p 10200 read --db 1 --offset 0 --size 4
 
 ## Tag address syntax
 
+DB tags use a comma or dot separator:
+
 ```
 DB<n>,<type><byte-offset>
-DB<n>,<byte-offset>.<bit>
+DB<n>.<type><byte-offset>   # dot separator, same result
+DB<n>,<byte-offset>.<bit>   # bit access
 ```
 
-| Type | Width | Example |
-|---|---|---|
-| `REAL` | 4 B | `DB1,REAL0` |
-| `DINT` | 4 B | `DB1,DINT4` |
-| `DWORD` | 4 B | `DB1,DWORD4` |
-| `INT` | 2 B | `DB1,INT8` |
-| `WORD` | 2 B | `DB1,WORD8` |
-| `BYTE` | 1 B | `DB1,BYTE10` |
-| bit | 1 bit | `DB1,332.0` |
+Merker, Timer, Counter tags are single-part — no separator:
+
+```
+M<byte>.<bit>    MX<byte>.<bit>    MB<byte>    MW<byte>    MD<byte>
+T<n>    C<n>
+```
+
+| Area | Type | Width | Example |
+|---|---|---|---|
+| DB | `REAL` | 4 B | `DB1,REAL0` |
+| DB | `DINT` | 4 B | `DB1,DINT4` |
+| DB | `DWORD` | 4 B | `DB1,DWORD4` |
+| DB | `INT` | 2 B | `DB1,INT8` |
+| DB | `WORD` | 2 B | `DB1,WORD8` |
+| DB | `BYTE` | 1 B | `DB1,BYTE10` |
+| DB | bit | 1 bit | `DB1,332.0` |
+| Merker | bit | 1 bit | `M10.3` / `MX10.3` |
+| Merker | byte | 1 B | `MB10` |
+| Merker | word | 2 B | `MW20` |
+| Merker | dword | 4 B | `MD4` |
+| Timer | S5Time | 2 B | `T5` |
+| Counter | BCD | 2 B | `C3` |
 
 ## License
 

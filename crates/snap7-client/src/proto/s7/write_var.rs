@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::proto::error::ProtoError;
+use crate::proto::s7::header::TransportSize;
 use crate::proto::s7::read_var::{AddressItem, ADDR_ANY, ITEM_LEN, ITEM_SPEC};
 
 pub const FUNC_WRITE_VAR: u8 = 0x05;
@@ -124,7 +125,10 @@ impl WriteVarRequest {
             buf.put_u16(addr.length);
             buf.put_u16(addr.db_number);
             buf.put_u8(addr.area as u8);
-            let addr_bits = (addr.start * 8) | (addr.bit_offset as u32);
+            let addr_bits = match addr.transport {
+                TransportSize::Timer | TransportSize::Counter => addr.start,
+                _ => (addr.start * 8) | (addr.bit_offset as u32),
+            };
             buf.put_u8(((addr_bits >> 16) & 0xFF) as u8);
             buf.put_u8(((addr_bits >> 8) & 0xFF) as u8);
             buf.put_u8((addr_bits & 0xFF) as u8);

@@ -257,6 +257,62 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         Ok(resp.items[0].data.clone())
     }
 
+    /// Read from any PLC area with explicit transport size.
+    ///
+    /// For DB areas use `db_read`. For Marker/Timer/Counter use this method.
+    /// Timer (`area=Timer, transport=Timer`) and Counter (`area=Counter, transport=Counter`)
+    /// use element-index addressing (no ×8 shift) and return 2 bytes per element.
+    pub async fn read_area(
+        &self,
+        area: Area,
+        db_number: u16,
+        start: u32,
+        element_count: u16,
+        transport: TransportSize,
+    ) -> Result<Bytes> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+
+        let req = ReadVarRequest {
+            items: vec![AddressItem {
+                area,
+                db_number,
+                start,
+                bit_offset: 0,
+                length: element_count,
+                transport,
+            }],
+        };
+        let mut param_buf = BytesMut::new();
+        req.encode(&mut param_buf);
+
+        Self::send_s7(
+            &mut inner,
+            param_buf.freeze(),
+            Bytes::new(),
+            pdu_ref,
+            PduType::Job,
+        )
+        .await?;
+
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "read_area")?;
+        if body.remaining() >= 2 {
+            body.advance(2);
+        }
+        let resp = ReadVarResponse::decode(&mut body, 1)?;
+        if resp.items.is_empty() {
+            return Err(Error::UnexpectedResponse);
+        }
+        if resp.items[0].return_code != 0xFF {
+            return Err(Error::PlcError {
+                code: resp.items[0].return_code as u32,
+                message: "item error".into(),
+            });
+        }
+        Ok(resp.items[0].data.clone())
+    }
+
     /// Read multiple PLC regions in one or more S7 PDU exchanges.
     ///
     /// Automatically batches items when the item count would exceed the Siemens hard
@@ -495,6 +551,61 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         Ok(())
     }
 
+    /// Write to any PLC area with explicit transport size.
+    ///
+    /// For Timer/Counter areas the transport size byte in the request must match
+    /// the area (0x1D / 0x1C). For Marker use `TransportSize::Byte`.
+    pub async fn write_area(
+        &self,
+        area: Area,
+        db_number: u16,
+        start: u32,
+        transport: TransportSize,
+        data: &[u8],
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+
+        let req = WriteVarRequest {
+            items: vec![WriteItem {
+                address: AddressItem {
+                    area,
+                    db_number,
+                    start,
+                    bit_offset: 0,
+                    length: data.len() as u16,
+                    transport,
+                },
+                data: Bytes::copy_from_slice(data),
+            }],
+        };
+        let mut param_buf = BytesMut::new();
+        req.encode(&mut param_buf);
+
+        Self::send_s7(
+            &mut inner,
+            param_buf.freeze(),
+            Bytes::new(),
+            pdu_ref,
+            PduType::Job,
+        )
+        .await?;
+
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "write_area")?;
+        if body.has_remaining() {
+            body.advance(2);
+        }
+        let resp = WriteVarResponse::decode(&mut body, 1)?;
+        if resp.return_codes[0] != 0xFF {
+            return Err(Error::PlcError {
+                code: resp.return_codes[0] as u32,
+                message: "write_area error".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Read from any PLC area using absolute addressing.
     ///
     /// A convenience wrapper around [`read_multi_vars`](Self::read_multi_vars)
@@ -683,33 +794,31 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         Self::simple_control(&mut inner, pdu_ref, 0x2A).await
     }
 
-    /// Read the current PLC status (S7 function code 0x31).
+    /// Read the current PLC status via SZL 0x0424.
     ///
     /// Returns one of [`PlcStatus::Run`], [`PlcStatus::Stop`], or
     /// [`PlcStatus::Unknown`].
     pub async fn get_plc_status(&self) -> Result<crate::types::PlcStatus> {
-        let mut inner = self.inner.lock().await;
-        let pdu_ref = Self::next_pdu_ref(&mut inner);
-        let param = Bytes::copy_from_slice(&[0x31, 0x00]);
-        Self::send_s7(&mut inner, param, Bytes::new(), pdu_ref, PduType::Job).await?;
-        let (header, mut body) = Self::recv_s7(&mut inner).await?;
-        check_plc_error(&header, "get_plc_status")?;
-        // Skip param echo: func (1) + reserved (1)
-        if body.remaining() >= 2 {
-            body.advance(2);
+        let payload = self.read_szl_payload(0x0424, 0x0000).await?;
+        // SZL 0x0424 response layout (after stripping 4-byte data envelope):
+        //   [0..1]  SZL_ID  (0x0424)
+        //   [2..3]  SZL_INDEX (0x0000)
+        //   [4..5]  LENTHDR (entry length in bytes, big-endian)
+        //   [6..7]  N_DR (entry count, big-endian)
+        //   [8..]   first entry data
+        // C snap7 strips SZL_ID+SZL_INDEX (4 bytes), so its opData[7] = payload[11].
+        // Status byte = 4th byte of first entry = payload[11].
+        if payload.len() < 12 {
+            return Ok(crate::types::PlcStatus::Unknown);
         }
-        if body.remaining() < 1 {
-            return Err(Error::UnexpectedResponse);
-        }
-        let status_byte = body.get_u8();
+        let status_byte = payload[11];
         match status_byte {
             0x00 => Ok(crate::types::PlcStatus::Unknown),
             0x04 => Ok(crate::types::PlcStatus::Stop),
             0x08 => Ok(crate::types::PlcStatus::Run),
-            other => Err(Error::PlcError {
-                code: other as u32,
-                message: format!("unknown PLC status byte: 0x{other:02X}"),
-            }),
+            // Old CPUs sometimes encode STOP as 0x03
+            0x03 => Ok(crate::types::PlcStatus::Stop),
+            _ => Ok(crate::types::PlcStatus::Stop),
         }
     }
 
@@ -982,7 +1091,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
     pub async fn read_module_list(&self) -> Result<Vec<crate::types::ModuleEntry>> {
         let payload = self.read_szl_payload(0x00A0, 0x0000).await?;
         if payload.len() < 6 {
-            return Err(Error::UnexpectedResponse);
+            return Ok(Vec::new());
         }
         let mut b = payload;
         let _block_len = b.get_u16();
@@ -999,81 +1108,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         Ok(modules)
     }
 
-    // -- Block list & block info (via SZL + UserData) -------------------------
+    // -- Block list & block info (via UserData grBlocksInfo) ------------------
 
-    /// List all blocks in the PLC grouped by type (SZL 0x0130).
+    /// List all blocks in the PLC grouped by type.
     ///
-    /// Returns a [`BlockList`] with the total block count and per-type entries.
+    /// Uses UserData function group 0x43 (grBlocksInfo), SubFun 0x01 (ListAll).
+    /// Response: 7 entries of [Zero(1) BType(1) BCount(2)] = 28 bytes data.
     pub async fn list_blocks(&self) -> Result<crate::types::BlockList> {
-        let payload = self.read_szl_payload(0x0130, 0x0000).await?;
-        if payload.len() < 10 {
-            return Err(Error::UnexpectedResponse);
-        }
-        let mut b = payload;
-        let _block_len = b.get_u16();
-        let _resp_szl_id = b.get_u16();
-        let _szl_ix = b.get_u16();
-
-        // S7-1500 format: strip sub-block header and entry prefixes.
-        let mut szl_data = b;
-        if szl_data.len() >= 2 && szl_data[0] == 0x04
-            && (szl_data[1] == 0x02 || szl_data[1] == 0x03)
-        {
-            szl_data.advance(2);
-            while szl_data.len() >= 4
-                && szl_data[0] == 0xFF && szl_data[1] == 0x04
-            {
-                let entry_len = u16::from_be_bytes([szl_data[2], szl_data[3]]) as usize;
-                let skip = 4 + entry_len;
-                if skip > szl_data.len() { break; }
-                szl_data.advance(skip);
-            }
-        }
-        // Skip the optional SZL entry_length prefix (2 bytes).
-        skip_szl_entry_header(&mut szl_data);
-        let total_count = szl_data.get_u32();
-        let mut entries = Vec::new();
-        while szl_data.remaining() >= 4 {
-            entries.push(crate::types::BlockListEntry {
-                block_type: szl_data.get_u16(),
-                count: szl_data.get_u16(),
-            });
-        }
-        Ok(crate::types::BlockList {
-            total_count,
-            entries,
-        })
-    }
-
-    /// Internal: send a UserData block-info request and return the raw response
-    /// data section payload (4-byte envelope skipped).
-    async fn block_info_query(
-        &self,
-        func: u8,
-        block_type: u8,
-        block_number: u16,
-    ) -> Result<Bytes> {
         let mut inner = self.inner.lock().await;
         let pdu_ref = Self::next_pdu_ref(&mut inner);
 
-        // UserData param for block info (function 0x13 or 0x14):
-        //   [8-byte header] [block_type(1)] [0x00] [block_number(2)]
-        let mut param_buf = BytesMut::with_capacity(12);
-        param_buf.extend_from_slice(&[
-            0x00, 0x01, 0x12, 0x04, func, 0x44, 0x01, 0x00,
-            block_type, 0x00,
-        ]);
-        param_buf.put_u16(block_number);
+        // Params: Head[00 01 12 04] + Uk=0x11 + Tg=0x43(grBlocksInfo) + SubFun=0x01(ListAll) + Seq=0x00
+        let param = Bytes::from_static(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x43, 0x01, 0x00]);
+        // Data: 4 bytes constant
+        let data = Bytes::from_static(&[0x0A, 0x00, 0x00, 0x00]);
 
-        Self::send_s7(
-            &mut inner,
-            param_buf.freeze(),
-            Bytes::new(),
-            pdu_ref,
-            PduType::UserData,
-        )
-        .await?;
-
+        Self::send_s7(&mut inner, param, data, pdu_ref, PduType::UserData).await?;
         let (header, mut body) = Self::recv_s7(&mut inner).await?;
 
         // Skip echoed param section
@@ -1082,11 +1132,174 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         }
         body.advance(header.param_len as usize);
 
-        // Skip 4-byte data envelope (return_code, transport, data_len)
+        // Data envelope: RetVal(1) + TRSize(1) + Length(2)
+        if body.remaining() < 4 {
+            return Ok(crate::types::BlockList { total_count: 0, entries: Vec::new() });
+        }
+        let _ret_val = body.get_u8();
+        let _tr_size = body.get_u8();
+        let data_len = body.get_u16() as usize;
+
+        // 7 entries × 4 bytes = 28 bytes
+        if data_len < 28 || body.remaining() < 28 {
+            return Ok(crate::types::BlockList { total_count: 0, entries: Vec::new() });
+        }
+
+        let mut entries = Vec::new();
+        let mut total_count: u32 = 0;
+        for _ in 0..7 {
+            let _zero = body.get_u8();
+            let block_type = body.get_u8() as u16;
+            let count = body.get_u16();
+            total_count += count as u32;
+            entries.push(crate::types::BlockListEntry { block_type, count });
+        }
+
+        Ok(crate::types::BlockList { total_count, entries })
+    }
+
+    /// List all block numbers of a given type (grBlocksInfo / SFun_ListBoT = 0x02).
+    ///
+    /// `block_type` is the raw byte: 0x38=OB, 0x41=DB, 0x42=SDB, 0x43=FC,
+    /// 0x44=SFC, 0x45=FB, 0x46=SFB.
+    /// Returns a sorted vec of block numbers.
+    pub async fn list_blocks_of_type(&self, block_type: u8) -> Result<Vec<u16>> {
+        let mut numbers: Vec<u16> = Vec::new();
+        let mut first = true;
+        let mut seq: u8 = 0x00;
+
+        loop {
+            let mut inner = self.inner.lock().await;
+            let pdu_ref = Self::next_pdu_ref(&mut inner);
+
+            let (param, data) = if first {
+                // First request: 8-byte params + 6-byte data
+                // Params: Head[00 01 12 04] Uk=0x11 Tg=0x43 SubFun=0x02 Seq=0x00
+                // Data:   RetVal=0xFF TSize=0x09 Length=0x0002 Zero=0x30 BlkType
+                let mut p = BytesMut::with_capacity(8);
+                p.extend_from_slice(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x43, 0x02, 0x00]);
+                let mut d = BytesMut::with_capacity(6);
+                d.extend_from_slice(&[0xFF, 0x09, 0x00, 0x02, 0x30, block_type]);
+                (p.freeze(), d.freeze())
+            } else {
+                // Continuation: 12-byte params + 4-byte data
+                // Params: Head[00 01 12 08] Uk=0x12 Tg=0x43 SubFun=0x02 Seq=<seq> + 4 zero pad
+                // Data:   0x0A 0x00 0x00 0x00
+                let mut p = BytesMut::with_capacity(12);
+                p.extend_from_slice(&[0x00, 0x01, 0x12, 0x08, 0x12, 0x43, 0x02, seq, 0x00, 0x00, 0x00, 0x00]);
+                let d = Bytes::from_static(&[0x0A, 0x00, 0x00, 0x00]);
+                (p.freeze(), d)
+            };
+
+            Self::send_s7(&mut inner, param, data, pdu_ref, PduType::UserData).await?;
+            let (header, mut body) = Self::recv_s7(&mut inner).await?;
+
+            // Skip echoed params
+            if body.remaining() < header.param_len as usize {
+                return Err(Error::UnexpectedResponse);
+            }
+            // Grab seq + done flag from params before advancing
+            // ResParams layout (after S7 header): Head[3] Plen Uk Tg SubFun Seq [Rsvd(2) ErrNo(2)]
+            // Seq is at param offset 7, Rsvd high byte at offset 8 indicates done (0x00 = done)
+            let param_bytes = body.slice(..header.param_len as usize);
+            let done = param_bytes.len() >= 10 && param_bytes[8] == 0x00;
+            seq = if param_bytes.len() >= 8 { param_bytes[7] } else { 0 };
+            body.advance(header.param_len as usize);
+            drop(inner);
+
+            // Data envelope: RetVal(1) TSize(1) DataLen(2)
+            if body.remaining() < 4 { break; }
+            let ret_val = body.get_u8();
+            let _tr_size = body.get_u8();
+            let data_len = body.get_u16() as usize;
+
+            if ret_val != 0xFF || data_len < 4 || body.remaining() < data_len { break; }
+
+            // Items: each 4 bytes [BlockNum(2) Unknown(1) BlockLang(1)]
+            // Count = (data_len - 4) / 4 + 1  (from C snap7 source)
+            let item_count = ((data_len - 4) / 4) + 1;
+            for _ in 0..item_count {
+                if body.remaining() < 4 { break; }
+                let block_num = body.get_u16();
+                let _unknown = body.get_u8();
+                let _lang = body.get_u8();
+                numbers.push(block_num);
+            }
+
+            first = false;
+            if done { break; }
+        }
+
+        numbers.sort_unstable();
+        Ok(numbers)
+    }
+
+    /// Internal: send a UserData block-info request (grBlocksInfo / SFun_BlkInfo=0x03).
+    ///
+    /// Params (8 bytes): Head[00 01 12 04] Uk=0x11 Tg=0x43 SubFun=0x03 Seq=0x00
+    /// Data  (12 bytes): FF 09 00 08 30 <blktype> <ascii5> 41
+    async fn block_info_query(
+        &self,
+        _func: u8,
+        block_type: u8,
+        block_number: u16,
+    ) -> Result<Bytes> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+
+        // Params: Head[00 01 12 04] Uk=0x11 Tg=0x43(grBlocksInfo) SubFun=0x03(BlkInfo) Seq=0x00
+        let param = Bytes::from_static(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x43, 0x03, 0x00]);
+
+        // Data: RetVal=0xFF TSize=0x09 DataLen=0x0008 BlkPrfx=0x30 BlkType AsciiBlk[5] A=0x41
+        let mut data_buf = BytesMut::with_capacity(12);
+        data_buf.extend_from_slice(&[0xFF, 0x09, 0x00, 0x08, 0x30, block_type]);
+        // block_number as 5-digit ASCII
+        let n = block_number as u32;
+        data_buf.put_u8((n / 10000) as u8 + 0x30);
+        data_buf.put_u8(((n % 10000) / 1000) as u8 + 0x30);
+        data_buf.put_u8(((n % 1000) / 100) as u8 + 0x30);
+        data_buf.put_u8(((n % 100) / 10) as u8 + 0x30);
+        data_buf.put_u8((n % 10) as u8 + 0x30);
+        data_buf.put_u8(0x41); // 'A'
+
+        Self::send_s7(&mut inner, param, data_buf.freeze(), pdu_ref, PduType::UserData).await?;
+
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+
+        // Response params: TResFunGetBlockInfo (12 bytes)
+        // Head[3] Plen Uk Tg SubFun Seq Rsvd[2] ErrNo[2]
+        let param_len = header.param_len as usize;
+        if body.remaining() < param_len {
+            return Err(Error::UnexpectedResponse);
+        }
+        let params = body.slice(..param_len);
+        body.advance(param_len);
+
+        // Check ErrNo (bytes 10-11 of params)
+        if params.len() >= 12 {
+            let err_no = u16::from_be_bytes([params[10], params[11]]);
+            if err_no != 0 {
+                return Err(Error::PlcError {
+                    code: err_no as u32,
+                    message: format!("block info error: ErrNo=0x{err_no:04X}"),
+                });
+            }
+        }
+
+        // Data envelope: RetVal(1) TSize(1) DataLen(2)
         if body.remaining() < 4 {
             return Err(Error::UnexpectedResponse);
         }
-        body.advance(4);
+        let ret_val = body.get_u8();
+        let _tr_size = body.get_u8();
+        let _data_len = body.get_u16();
+
+        if ret_val != 0xFF {
+            return Err(Error::PlcError {
+                code: ret_val as u32,
+                message: format!("block info RetVal=0x{ret_val:02X}"),
+            });
+        }
 
         Ok(body.copy_to_bytes(body.remaining()))
     }
@@ -1125,56 +1338,64 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let payload = self
             .block_info_query(func, block_type, block_number)
             .await?;
-        // Minimum for a valid block info: 6-byte header + block_type + block_number + language + flags + ...
-        if payload.len() < 24 {
+
+        // Payload = TResDataBlockInfo fields after the 4-byte envelope (RetVal/TSize/DataLen
+        // already consumed in block_info_query). Struct layout:
+        //   Cst_b(1) BlkType(1) Cst_w1(2) Cst_w2(2) Cst_pp(2)
+        //   Unknown_1(1) BlkFlags(1) BlkLang(1) SubBlkType(1) BlkNumber(2)
+        //   LenLoadMem(4) BlkSec(4) CodeTime_ms(4) CodeTime_dy(2)
+        //   IntfTime_ms(4) IntfTime_dy(2) SbbLen(2) AddLen(2)
+        //   LocDataLen(2) MC7Len(2)
+        //   Author(8) Family(8) Header(8)
+        //   Version(1) Unknown_2(1) BlkChksum(2) Resvd1(4) Resvd2(4)
+        // Minimum meaningful size: 40 bytes
+        if payload.len() < 40 {
             return Err(Error::UnexpectedResponse);
         }
         let mut b = payload;
 
-        // Parse block info response (field order derived from S7 protocol):
-        let _blk_type_hi = b.get_u16(); // may echo block type as u16
-        let blk_number = b.get_u16();
-        let language = b.get_u16();
-        let flags = b.get_u16();
-        let mc7_size = b.get_u16();
-        let _size_lo = b.get_u16(); // load-memory size low word
-        let size_ram = b.get_u16();
-        let _size_ro = b.get_u16(); // 0 or RO-size
-        let local_data = b.get_u16();
-        let checksum = b.get_u16();
-        let version = b.get_u16();
+        let _cst_b       = b.get_u8();
+        let blk_type: u16 = b.get_u8().into();
+        let _cst_w1      = b.get_u16();
+        let _cst_w2      = b.get_u16();
+        let _cst_pp      = b.get_u16();
+        let _unknown_1   = b.get_u8();
+        let flags        = b.get_u8() as u16;
+        let language     = b.get_u8() as u16;
+        let _sub_blk     = b.get_u8();
+        let _blk_number  = b.get_u16(); // echoes block_number from request
+        let len_load_mem = b.get_u32();
+        let _blk_sec     = b.get_u32();
+        let _code_ms     = b.get_u32();
+        let _code_dy     = b.get_u16();
+        let _intf_ms     = b.get_u32();
+        let _intf_dy     = b.get_u16();
+        let sbb_len      = b.get_u16();
+        let _add_len     = b.get_u16();
+        let local_data   = b.get_u16();
+        let mc7_size     = b.get_u16();
 
-        // String fields: author(8), family(8), header(20?), date(8)
-        let author = if b.remaining() >= 8 {
-            String::from_utf8_lossy(&b[..8]).trim_end_matches('\0').trim().to_string()
-        } else { String::new() };
-        b.advance(8.min(b.remaining()));
+        fn read_str(b: &mut Bytes, n: usize) -> String {
+            let s = b.slice(..n.min(b.remaining()));
+            b.advance(n.min(b.remaining()));
+            let end = s.iter().position(|&x| x == 0).unwrap_or(s.len());
+            String::from_utf8_lossy(&s[..end]).trim().to_string()
+        }
 
-        let family = if b.remaining() >= 8 {
-            String::from_utf8_lossy(&b[..8]).trim_end_matches('\0').trim().to_string()
-        } else { String::new() };
-        b.advance(8.min(b.remaining()));
-
-        let header = if b.remaining() >= 20 {
-            String::from_utf8_lossy(&b[..20]).trim_end_matches('\0').trim().to_string()
-        } else { String::new() };
-        b.advance(20.min(b.remaining()));
-
-        let date = if b.remaining() >= 8 {
-            String::from_utf8_lossy(&b[..8]).trim_end_matches('\0').trim().to_string()
-        } else { String::new() };
-
-        // Reconstruct total size from the two size halves
-        let size = ((_blk_type_hi as u32) << 16) | (b.len() as u32 & 0xFFFF);
-        let size_u16 = size.min(0xFFFF) as u16;
+        let author   = read_str(&mut b, 8);
+        let family   = read_str(&mut b, 8);
+        let header   = read_str(&mut b, 8);
+        let version  = if b.remaining() >= 1 { b.get_u8() as u16 } else { 0 };
+        let _unk2    = if b.remaining() >= 1 { b.get_u8() } else { 0 };
+        let checksum = if b.remaining() >= 2 { b.get_u16() } else { 0 };
 
         Ok(crate::types::BlockInfo {
-            block_type: _blk_type_hi,
-            block_number: blk_number,
+            block_type: blk_type,
+            block_number,
             language,
             flags,
-            size: size_u16,
-            size_ram,
+            size: (len_load_mem.min(0xFFFF)) as u16,
+            size_ram: sbb_len,
             mc7_size,
             local_data,
             checksum,
@@ -1182,7 +1403,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
             author,
             family,
             header,
-            date,
+            date: String::new(),
         })
     }
 
@@ -2155,19 +2376,39 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         mock_handshake(&mut server_io).await;
 
-        // GetPlcStatus request — consume
+        // GetPlcStatus request (UserData SZL) — consume
         let _ = server_io.read(&mut buf).await;
 
-        // Response: param echo [0x31, 0x00] + status byte
-        let data = &[0x31u8, 0x00, status_byte]; // param(2) + data(1)
-        let data_len = data.len() as u16;
+        // SZL 0x0424 response payload layout (after data envelope):
+        //   [0..1]  SZL_ID = 0x0424
+        //   [2..3]  SZL_INDEX = 0x0000
+        //   [4..5]  LENTHDR (entry length)
+        //   [6..7]  N_DR = 0x0001
+        //   [8..10] first 3 bytes of entry
+        //   [11]    status byte (payload[11])
+        let mut szl_payload = [0u8; 12];
+        szl_payload[0..2].copy_from_slice(&0x0424u16.to_be_bytes());
+        szl_payload[6..8].copy_from_slice(&0x0001u16.to_be_bytes()); // N_DR = 1
+        szl_payload[11] = status_byte;
+
+        // UserData response body:
+        //   params (8 bytes, echoed): [0x00,0x01,0x12,0x08,0x12,0x84,0x01,0x00]
+        //   data envelope (4 bytes): return_code=0xFF, transport=0x09, len=12
+        //   szl_payload (12 bytes)
+        let params: [u8; 8] = [0x00, 0x01, 0x12, 0x08, 0x12, 0x84, 0x01, 0x00];
+        let data_envelope: [u8; 4] = [0xFF, 0x09, 0x00, 0x0C];
+        let param_len = params.len() as u16;
+        let data_len = (data_envelope.len() + szl_payload.len()) as u16;
+
         let mut s7b = BytesMut::new();
         S7Header {
-            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 2,
-            param_len: 2, data_len,
-            error_class: Some(0), error_code: Some(0),
+            pdu_type: PduType::UserData, reserved: 0, pdu_ref: 2,
+            param_len, data_len,
+            error_class: None, error_code: None,
         }.encode(&mut s7b);
-        s7b.extend_from_slice(data);
+        s7b.extend_from_slice(&params);
+        s7b.extend_from_slice(&data_envelope);
+        s7b.extend_from_slice(&szl_payload);
         let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
         let mut cb = BytesMut::new(); dt.encode(&mut cb);
         let mut tb = BytesMut::new();
@@ -2206,12 +2447,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_plc_status_unknown_byte_returns_error() {
+    async fn get_plc_status_unknown_byte_returns_stop() {
+        // Unknown status bytes default to Stop (C snap7 behavior)
         let (client_io, server_io) = duplex(4096);
         let params = ConnectParams::default();
         tokio::spawn(mock_plc_status(server_io, 0xFF));
         let client = S7Client::from_transport(client_io, params).await.unwrap();
-        let result = client.get_plc_status().await;
-        assert!(result.is_err());
+        let status = client.get_plc_status().await.unwrap();
+        assert_eq!(status, crate::types::PlcStatus::Stop);
     }
 }

@@ -46,7 +46,11 @@ impl ReadVarRequest {
             buf.put_u16(item.length);
             buf.put_u16(item.db_number);
             buf.put_u8(item.area as u8);
-            let addr_bits = (item.start * 8) | (item.bit_offset as u32);
+            // Timer/Counter: address is element index, no bit-shift (C snap7 behavior)
+            let addr_bits = match item.transport {
+                TransportSize::Timer | TransportSize::Counter => item.start,
+                _ => (item.start * 8) | (item.bit_offset as u32),
+            };
             buf.put_u8(((addr_bits >> 16) & 0xFF) as u8);
             buf.put_u8(((addr_bits >> 8) & 0xFF) as u8);
             buf.put_u8((addr_bits & 0xFF) as u8);

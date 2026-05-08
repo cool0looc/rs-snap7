@@ -34,6 +34,8 @@ pub enum Area {
     DataBlock = 0x84,
     InstanceDB = 0x85,
     LocalData = 0x86,
+    Counter = 0x1C,
+    Timer = 0x1D,
 }
 
 impl TryFrom<u8> for Area {
@@ -46,6 +48,8 @@ impl TryFrom<u8> for Area {
             0x84 => Ok(Area::DataBlock),
             0x85 => Ok(Area::InstanceDB),
             0x86 => Ok(Area::LocalData),
+            0x1C => Ok(Area::Counter),
+            0x1D => Ok(Area::Timer),
             _ => Err(ProtoError::UnsupportedArea(v)),
         }
     }
@@ -67,6 +71,8 @@ pub enum TransportSize {
     Time = 0x0B,
     S5Time = 0x0C,
     DtL = 0x0F,
+    Counter = 0x1C,
+    Timer = 0x1D,
 }
 
 impl TryFrom<u8> for TransportSize {
@@ -86,6 +92,8 @@ impl TryFrom<u8> for TransportSize {
             0x0B => Ok(TransportSize::Time),
             0x0C => Ok(TransportSize::S5Time),
             0x0F => Ok(TransportSize::DtL),
+            0x1C => Ok(TransportSize::Counter),
+            0x1D => Ok(TransportSize::Timer),
             _ => Err(ProtoError::UnsupportedTransportSize(v)),
         }
     }
