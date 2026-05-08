@@ -1,6 +1,6 @@
 [package]
 name = "snap7-server"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Async Rust S7 PLC simulator/server for testing and development"
 license = "MIT"

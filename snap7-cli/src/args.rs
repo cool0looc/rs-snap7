@@ -82,6 +82,9 @@ pub struct ReadArgs {
     pub offset: u32,
     #[arg(long)]
     pub size: u16,
+    /// S7 area: db (default), merker, pi, pa, inst, local
+    #[arg(long, default_value = "db")]
+    pub area: AreaArg,
 }
 
 #[derive(clap::Args, Debug)]
@@ -92,6 +95,45 @@ pub struct WriteArgs {
     pub offset: u32,
     #[arg(long, help = "Hex bytes, e.g. DEADBEEF")]
     pub data: String,
+    /// S7 area: db (default), merker, pi, pa, inst, local
+    #[arg(long, default_value = "db")]
+    pub area: AreaArg,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum AreaArg {
+    Db,
+    Merker,
+    Pi,
+    Pa,
+    Inst,
+    Local,
+}
+
+impl std::fmt::Display for AreaArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AreaArg::Db => write!(f, "db"),
+            AreaArg::Merker => write!(f, "merker"),
+            AreaArg::Pi => write!(f, "pi"),
+            AreaArg::Pa => write!(f, "pa"),
+            AreaArg::Inst => write!(f, "inst"),
+            AreaArg::Local => write!(f, "local"),
+        }
+    }
+}
+
+impl From<AreaArg> for snap7_client::proto::s7::header::Area {
+    fn from(a: AreaArg) -> Self {
+        match a {
+            AreaArg::Db => snap7_client::proto::s7::header::Area::DataBlock,
+            AreaArg::Merker => snap7_client::proto::s7::header::Area::Marker,
+            AreaArg::Pi => snap7_client::proto::s7::header::Area::ProcessInput,
+            AreaArg::Pa => snap7_client::proto::s7::header::Area::ProcessOutput,
+            AreaArg::Inst => snap7_client::proto::s7::header::Area::InstanceDB,
+            AreaArg::Local => snap7_client::proto::s7::header::Area::LocalData,
+        }
+    }
 }
 
 // --- Tag ---
@@ -140,11 +182,21 @@ pub enum BlockAction {
 
 // --- SZL ---
 
+/// Parse a u16 that accepts decimal (e.g. 17) or hex with 0x prefix (e.g. 0x11).
+fn parse_hex_or_decimal(s: &str) -> Result<u16, String> {
+    let s = s.trim();
+    if s.starts_with("0x") || s.starts_with("0X") {
+        u16::from_str_radix(&s[2..], 16).map_err(|e| format!("invalid hex value: {e}"))
+    } else {
+        s.parse::<u16>().map_err(|e| format!("invalid decimal value: {e}"))
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct SzlArgs {
-    #[arg(long, value_parser = clap::value_parser!(u16).range(0..))]
+    #[arg(long, value_parser = parse_hex_or_decimal)]
     pub id: u16,
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "0", value_parser = parse_hex_or_decimal)]
     pub index: u16,
 }
 

@@ -24,7 +24,7 @@ pub use tag::{parse_tag, TagAddress};
 pub use tls::{tls_connect, TlsStream};
 pub use types::{
     BlockData, BlockInfo, BlockList, BlockListEntry, BlockType, ConnectParams, CpuInfo, CpInfo,
-    ModuleEntry, OrderCode, PlcStatus, Protection,
+    ModuleEntry, OrderCode, PlcStatus, Protocol, Protection,
 };
 pub use types::encrypt_password;
 pub use udp::UdpTransport;

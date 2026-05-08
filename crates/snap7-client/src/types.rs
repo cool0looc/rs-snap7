@@ -37,6 +37,33 @@ pub enum PlcStatus {
 pub struct OrderCode {
     /// The order number (e.g. `"6ES7 317-2EK14-0AB0"`).
     pub code: String,
+    /// Firmware version major component.
+    pub v1: u8,
+    /// Firmware version minor component.
+    pub v2: u8,
+    /// Firmware version patch component.
+    pub v3: u8,
+}
+
+/// Protocol variant used by the PLC.
+///
+/// - **S7** — Classic S7 protocol, used by S7-300, S7-400, S7-1200
+/// - **S7Plus** — S7+ (S7-Plus) protocol, used by S7-1500
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// Classic S7 protocol (S7-300, S7-400, S7-1200).
+    S7,
+    /// S7+ protocol (S7-1500).
+    S7Plus,
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Protocol::S7 => write!(f, "S7"),
+            Protocol::S7Plus => write!(f, "S7+"),
+        }
+    }
 }
 
 /// Result of [`S7Client::get_cpu_info`](crate::S7Client::get_cpu_info).
@@ -52,6 +79,8 @@ pub struct CpuInfo {
     pub copyright: String,
     /// Module name.
     pub module_name: String,
+    /// Protocol version used by the PLC (S7 for 300/400, S7+ for 1500).
+    pub protocol: Protocol,
 }
 
 /// Result of [`S7Client::get_cp_info`](crate::S7Client::get_cp_info).

@@ -543,20 +543,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         Ok(SzlResponse::decode(&mut b)?)
     }
 
-    /// Send a UserData SZL query and return the raw SZL data block payload
-    /// (starting with block_len, szl_id, szl_index, then the data).
+    /// Send a UserData SZL query and return the raw SZL data block
+    /// (starting with block_len, szl_id, szl_index, then entry data).
     async fn read_szl_payload(&self, szl_id: u16, szl_index: u16) -> Result<Bytes> {
         let mut inner = self.inner.lock().await;
         let pdu_ref = Self::next_pdu_ref(&mut inner);
 
         let req = SzlRequest { szl_id, szl_index };
         let mut param_buf = BytesMut::new();
-        req.encode(&mut param_buf);
+        req.encode_params(&mut param_buf);
+        let mut data_buf = BytesMut::new();
+        req.encode_data(&mut data_buf);
 
         Self::send_s7(
             &mut inner,
             param_buf.freeze(),
-            Bytes::new(),
+            data_buf.freeze(),
             pdu_ref,
             PduType::UserData,
         )
@@ -571,13 +573,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         body.advance(header.param_len as usize);
 
         // body is now the data section.
-        // Skip the 4-byte data envelope: return_code(1) + transport(1) + data_len(2)
+        // Data envelope: return_code(1) + transport(1) + data_len(2)
+        // If shorter than 4, the PLC returned an error with no data.
         if body.remaining() < 4 {
-            return Err(Error::UnexpectedResponse);
+            return Ok(Bytes::new());
         }
-        body.advance(4);
+        let return_code = body.get_u8();
+        let _transport = body.get_u8();
+        let _data_len = body.get_u16();
 
-        // Remaining is the SZL data block: block_len(2) + szl_id(2) + szl_ix(2) + data
+        // return_code 0xFF = success; anything else = PLC error (function not available etc.)
+        // Return empty payload so callers can handle gracefully.
+        if return_code != 0xFF {
+            return Ok(Bytes::new());
+        }
+
+        // Remaining is the SZL data block.
         Ok(body.copy_to_bytes(body.remaining()))
     }
 
@@ -712,101 +723,256 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         if payload.len() < 8 {
             return Err(Error::UnexpectedResponse);
         }
-        let mut b = payload;
-        let _block_len = b.get_u16();
-        let _szl_id = b.get_u16();
-        let _szl_ix = b.get_u16();
 
-        // Validate the response: the szl_id returned by the PLC must match
-        // what we requested.  If not, this SZL ID is not supported.
-        let resp_szl_id = _szl_id;
-        if resp_szl_id != 0x0011 {
-            return Err(Error::PlcError {
-                code: 0,
-                message: format!(
-                    "order-code query (SZL 0x0011) not supported by this PLC (returned szl_id=0x{:04X})",
-                    resp_szl_id
-                ),
-            });
+        // SZL 0x0011 payload: [szl_id:2][szl_index:2][entry_len:2][entry_count:2][entries...]
+        // Each entry: [index:2][data: entry_len-2 bytes, null-padded]
+        // Entry 0x0001 = order code string; version bytes = last 3 bytes of entire payload.
+        let n = payload.len();
+        let (v1, v2, v3) = if n >= 3 {
+            (payload[n - 3], payload[n - 2], payload[n - 1])
+        } else {
+            (0, 0, 0)
+        };
+
+        let mut b = payload.clone();
+        let szl_id = b.get_u16();
+        let _szl_idx = b.get_u16();
+        let entry_len = b.get_u16() as usize;
+        let entry_count = b.get_u16() as usize;
+
+        if (szl_id == 0x0011 || szl_id == 0x001C) && entry_len >= 4 && entry_count > 0 {
+            for _ in 0..entry_count {
+                if b.remaining() < entry_len { break; }
+                let entry_idx = b.get_u16();
+                let string_len = entry_len - 2;
+                let raw = b.copy_to_bytes(string_len);
+                if entry_idx == 0x0001 {
+                    let null_end = raw.iter().position(|&x| x == 0).unwrap_or(string_len);
+                    let code = String::from_utf8_lossy(&raw[..null_end]).trim().to_string();
+                    if !code.is_empty() {
+                        return Ok(crate::types::OrderCode { code, v1, v2, v3 });
+                    }
+                }
+            }
         }
 
-        // Order code is the first 20 bytes of SZL entry data, space-padded
-        let code_bytes = &b[..b.len().min(20)];
-        let code = String::from_utf8_lossy(code_bytes).trim().to_string();
-        Ok(crate::types::OrderCode { code })
+        // Fallback: scan for "6ES"/"6AV"/"6GK" pattern anywhere in payload.
+        let code = scan_ascii_fields(&payload, 10, 4).into_iter().find(|s| {
+            let su = s.to_uppercase();
+            (su.starts_with("6ES") || su.starts_with("6AV") || su.starts_with("6GK"))
+                && s.len() >= 10
+                && s.bytes().all(|c| c.is_ascii_graphic() || c == b' ')
+        }).unwrap_or_default();
+        Ok(crate::types::OrderCode { code, v1, v2, v3 })
     }
 
     /// Read detailed CPU information (SZL ID 0x001C).
     ///
     /// Returns module type, serial number, plant identification, copyright
     /// and module name fields pre-parsed from the SZL response.
+    /// Handles both classic S7-300/400 and S7-1200/1500 response formats.
     pub async fn get_cpu_info(&self) -> Result<crate::types::CpuInfo> {
         let payload = self.read_szl_payload(0x001C, 0x0000).await?;
         if payload.len() < 8 {
             return Err(Error::UnexpectedResponse);
         }
-        let mut b = payload;
-        let _block_len = b.get_u16();
-        let _szl_id = b.get_u16();
-        let _szl_ix = b.get_u16();
 
-        // Validate the response: the szl_id returned by the PLC must match
-        // what we requested.  If not, this SZL ID is not supported.
-        let resp_szl_id = _szl_id;
-        if resp_szl_id != 0x001C {
-            return Err(Error::PlcError {
-                code: 0,
-                message: format!(
-                    "cpu-info query (SZL 0x001C) not supported by this PLC (returned szl_id=0x{:04X})",
-                    resp_szl_id
-                ),
+        // SZL 0x001C payload layout (after correct request framing):
+        //   [szl_id:2=0x001C][szl_index:2][entry_len:2][entry_count:2]
+        //   followed by entry_count entries, each entry_len bytes:
+        //     [entry_index:2][string_data: entry_len-2 bytes, null-padded]
+        //
+        // Entry indices observed on S7-300/400:
+        //   0x0001 = plant identification (AS name)
+        //   0x0002 = module type name (e.g. "CPU 319-3 PN/DP")
+        //   0x0003 = module name (OB1 program name)
+        //   0x0004 = copyright
+        //   0x0005 = serial number
+        //   0x0007 = module type name (duplicate in some firmware)
+        //   0x0008 = module name (duplicate in some firmware)
+        let mut b = payload.clone();
+        let szl_id = b.get_u16();
+        let _szl_idx = b.get_u16();
+        let entry_len = b.get_u16() as usize;
+        let entry_count = b.get_u16() as usize;
+
+        if szl_id == 0x001C && entry_len >= 4 && entry_count > 0 {
+            let mut module_type = String::new();
+            let mut module_type_canonical = String::new(); // index 0x0007 — always authoritative
+            let mut serial_number = String::new();
+            let mut as_name = String::new();
+            let mut copyright = String::new();
+            let mut module_name = String::new();
+
+            for _ in 0..entry_count {
+                if b.remaining() < entry_len { break; }
+                let entry_idx = b.get_u16();
+                let string_len = entry_len - 2;
+                let raw = b.copy_to_bytes(string_len);
+                let null_end = raw.iter().position(|&x| x == 0).unwrap_or(string_len);
+                let val = String::from_utf8_lossy(&raw[..null_end]).trim().to_string();
+                match entry_idx {
+                    0x0001 => { if as_name.is_empty() { as_name = val; } }
+                    // 0x0002 is module type on S7-300, AS name on S7-1500 — only use if
+                    // 0x0007 is absent (module_type_canonical will override below).
+                    0x0002 => { if module_type.is_empty() { module_type = val; } }
+                    0x0003 => { if module_name.is_empty() { module_name = val; } }
+                    0x0004 => { if copyright.is_empty() { copyright = val; } }
+                    0x0005 => { if serial_number.is_empty() { serial_number = val; } }
+                    // 0x0007 is always the true module type name (both S7-300 and S7-1500)
+                    0x0007 => { if module_type_canonical.is_empty() { module_type_canonical = val; } }
+                    // 0x0008 is SMC memory card on S7-1500 — do not use for module_name
+                    _ => {}
+                }
+            }
+
+            // 0x0007 wins over 0x0002 for module_type
+            if !module_type_canonical.is_empty() {
+                module_type = module_type_canonical;
+            }
+
+            if module_name.is_empty() && !as_name.is_empty() {
+                module_name = as_name.clone();
+            }
+
+            if !module_type.is_empty() || !serial_number.is_empty() || !as_name.is_empty() {
+                let protocol = detect_protocol(&payload, &module_type);
+                return Ok(crate::types::CpuInfo {
+                    module_type,
+                    serial_number,
+                    as_name,
+                    copyright,
+                    module_name,
+                    protocol,
+                });
+            }
+        }
+
+        // S7-1500 and some firmware variants use a tagged sub-record format.
+        // Fall back to scanning the raw payload for tagged string fields.
+        let data = payload.as_ref();
+        let (module_type, serial_number, as_name, copyright, module_name) =
+            parse_sub_record_fields(data);
+
+        if !module_type.is_empty() || !serial_number.is_empty() {
+            let protocol = detect_protocol(&payload, &module_type);
+            return Ok(crate::types::CpuInfo {
+                module_type,
+                serial_number,
+                as_name,
+                copyright,
+                module_name,
+                protocol,
             });
         }
 
-        // SZL 0x001C response layout (each field is left-aligned, space-padded):
-        //   [0..24]  Module type name
-        //   [24..48] Serial number
-        //   [48..72] Plant identification (AS name)
-        //   [72..98] Copyright (26 bytes)
-        //   [98..122] Module name (24 bytes)
-        let module_type = extract_szl_string(&b, 0, 24);
-        let serial_number = extract_szl_string(&b, 24, 48);
-        let as_name = extract_szl_string(&b, 48, 72);
-        let copyright = extract_szl_string(&b, 72, 98);
-        let module_name = extract_szl_string(&b, 98, 122);
+        // Last-resort scan: extract printable strings and apply heuristics.
+        let mut module_type = String::new();
+        let mut serial_number = String::new();
+        let mut as_name = String::new();
+        let mut copyright = String::new();
+        let mut module_name = String::new();
+
+        let mut scan = 0;
+        while scan < data.len() {
+            if data[scan].is_ascii_graphic() || data[scan] == b' ' {
+                let start = scan;
+                while scan < data.len() && (data[scan].is_ascii_graphic() || data[scan] == b' ') {
+                    scan += 1;
+                }
+                let val = String::from_utf8_lossy(&data[start..scan]).trim().to_string();
+                if val.len() >= 3 {
+                    let tag = if start >= 2 && data[start - 2] == 0x00 {
+                        Some(data[start - 1])
+                    } else {
+                        None
+                    };
+                    let su = val.to_uppercase();
+                    if su.contains("BOOT") || su.starts_with("P B") || su.starts_with("HBOOT") {
+                        // skip firmware label
+                    } else if tag == Some(0x07) && module_type.is_empty() {
+                        module_type = val;
+                    } else if tag == Some(0x08) && module_name.is_empty() {
+                        module_name = val;
+                    } else if tag == Some(0x05) && as_name.is_empty() {
+                        as_name = val;
+                    } else if tag == Some(0x06) && copyright.is_empty() {
+                        copyright = val;
+                    } else if tag == Some(0x04) && serial_number.is_empty() {
+                        serial_number = val;
+                    } else if val.contains('-')
+                        && val.chars().filter(|c| c.is_ascii_digit()).count() >= 4
+                        && !val.starts_with("6ES7")
+                        && serial_number.is_empty()
+                    {
+                        serial_number = val;
+                    } else if su.contains("CPU") && su.contains("PN") && module_type.is_empty() {
+                        module_type = val;
+                    } else if module_type.is_empty() && val.len() >= 8 && !su.contains("MC_") {
+                        module_type = val;
+                    }
+                }
+            } else {
+                scan += 1;
+            }
+        }
+
+        let protocol = detect_protocol(&payload, &module_type);
         Ok(crate::types::CpuInfo {
             module_type,
             serial_number,
             as_name,
             copyright,
             module_name,
+            protocol,
         })
     }
-
-    /// Read communication processor information (SZL ID 0x0131).
+    
+    /// Read communication processor information (SZL ID 0x0131, index 0x0001).
     ///
     /// Returns maximum PDU length, connection count, and baud rates.
     pub async fn get_cp_info(&self) -> Result<crate::types::CpInfo> {
-        let payload = self.read_szl_payload(0x0131, 0x0000).await?;
-        if payload.len() < 14 {
-            return Err(Error::UnexpectedResponse);
+        // Index 0x0001 = communication module info entry (used by C snap7).
+        let payload = self.read_szl_payload(0x0131, 0x0001).await?;
+
+        // SZL 0x0131 response wire format (after stripping the 4-byte data envelope):
+        //   [szl_id:2][szl_index:2][entry_len:2][entry_count:2][entries...]
+        // Each entry for index 0x0001 (S7-300/400/1200/1500):
+        //   [index:2][max_pdu_len:2][max_connections:2][max_mpi_rate:4][max_bus_rate:4] = 14 bytes
+
+        let mut b = payload.clone();
+        if b.remaining() < 8 {
+            return Ok(crate::types::CpInfo {
+                max_pdu_len: 0, max_connections: 0, max_mpi_rate: 0, max_bus_rate: 0,
+            });
         }
-        let mut b = payload;
-        let _block_len = b.get_u16();
-        let _szl_id = b.get_u16();
-        let _szl_ix = b.get_u16();
-        // Skip the optional SZL entry_length prefix (2 bytes).
-        skip_szl_entry_header(&mut b);
-        // Next 16 bytes: 4 × u32 big-endian
-        let max_pdu_len = b.get_u32();
-        let max_connections = b.get_u32();
-        let max_mpi_rate = b.get_u32();
-        let max_bus_rate = b.get_u32();
+
+        let szl_id = b.get_u16();
+        let _szl_idx = b.get_u16();
+        let entry_len = b.get_u16() as usize;
+        let entry_count = b.get_u16() as usize;
+
+        // Classic format (S7-300/400/1200): szl_id=0x0131, entries with 14-byte records
+        if szl_id == 0x0131 && entry_len >= 12 && entry_count >= 1 && b.remaining() >= entry_len {
+            let _entry_idx = b.get_u16();
+            let max_pdu_len = b.get_u16() as u32;
+            let max_connections = b.get_u16() as u32;
+            let max_mpi_rate = b.get_u32();
+            let max_bus_rate = b.get_u32();
+            return Ok(crate::types::CpInfo {
+                max_pdu_len,
+                max_connections,
+                max_mpi_rate,
+                max_bus_rate,
+            });
+        }
+
+        // Fallback: scan for any parseable numeric data
         Ok(crate::types::CpInfo {
-            max_pdu_len,
-            max_connections,
-            max_mpi_rate,
-            max_bus_rate,
+            max_pdu_len: 0,
+            max_connections: 0,
+            max_mpi_rate: 0,
+            max_bus_rate: 0,
         })
     }
 
@@ -845,16 +1011,32 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         }
         let mut b = payload;
         let _block_len = b.get_u16();
-        let _szl_id = b.get_u16();
+        let _resp_szl_id = b.get_u16();
         let _szl_ix = b.get_u16();
+
+        // S7-1500 format: strip sub-block header and entry prefixes.
+        let mut szl_data = b;
+        if szl_data.len() >= 2 && szl_data[0] == 0x04
+            && (szl_data[1] == 0x02 || szl_data[1] == 0x03)
+        {
+            szl_data.advance(2);
+            while szl_data.len() >= 4
+                && szl_data[0] == 0xFF && szl_data[1] == 0x04
+            {
+                let entry_len = u16::from_be_bytes([szl_data[2], szl_data[3]]) as usize;
+                let skip = 4 + entry_len;
+                if skip > szl_data.len() { break; }
+                szl_data.advance(skip);
+            }
+        }
         // Skip the optional SZL entry_length prefix (2 bytes).
-        skip_szl_entry_header(&mut b);
-        let total_count = b.get_u32();
+        skip_szl_entry_header(&mut szl_data);
+        let total_count = szl_data.get_u32();
         let mut entries = Vec::new();
-        while b.remaining() >= 4 {
+        while szl_data.remaining() >= 4 {
             entries.push(crate::types::BlockListEntry {
-                block_type: b.get_u16(),
-                count: b.get_u16(),
+                block_type: szl_data.get_u16(),
+                count: szl_data.get_u16(),
             });
         }
         Ok(crate::types::BlockList {
@@ -1318,16 +1500,142 @@ fn skip_szl_entry_header(data: &mut Bytes) {
     }
 }
 
-/// Safely extract a fixed-width space-padded string field from SZL response data.
-///
-/// Returns the trimmed string, or an empty string if `start` is beyond the data length.
-fn extract_szl_string(data: &[u8], start: usize, end: usize) -> String {
-    if start >= data.len() {
-        return String::new();
+/// Scan byte data for sequences of visible ASCII characters and return them
+/// as a vector of trimmed strings.  Skips non-ASCII and control bytes between
+/// sequences.  Useful for extracting CPU info fields from SZL responses across
+/// different PLC models and firmware versions.
+fn scan_ascii_fields(data: &[u8], max_count: usize, min_len: usize) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut i = 0;
+    while i < data.len() && fields.len() < max_count {
+        // Skip bytes that are not visible ASCII (0x20-0x7E)
+        if !data[i].is_ascii_graphic() && data[i] != b' ' {
+            i += 1;
+            continue;
+        }
+        // Collect a run of visible ASCII
+        let start = i;
+        while i < data.len() && (data[i].is_ascii_graphic() || data[i] == b' ') {
+            i += 1;
+        }
+        let s = String::from_utf8_lossy(&data[start..i]).trim().to_string();
+        if s.len() >= min_len {
+            fields.push(s);
+        }
     }
-    let end = end.min(data.len());
-    String::from_utf8_lossy(&data[start..end]).trim().to_string()
+    fields
 }
+
+/// Parse the S7-300 sub-record format used in SZL 0x001C responses.
+///
+/// This format uses tagged records: `[00 <tag> <string>] ...` where
+/// known tags are:
+/// - 0x01: order code / module identification
+/// - 0x05: plant identification (AS name)
+/// - 0x06: serial number
+/// - 0x07: module type name
+/// - 0x08: module name
+fn parse_sub_record_fields(b: &[u8]) -> (String, String, String, String, String) {
+    let mut module_type = String::new();
+    let mut serial_number = String::new();
+    let mut as_name = String::new();
+    let mut copyright = String::new();
+    let mut module_name = String::new();
+
+    let mut i = 0;
+    while i + 2 < b.len() {
+        // Look for 00 <tag> pattern with a known sub-record tag (1..=8)
+        if b[i] == 0x00 && (1..=8).contains(&b[i + 1]) {
+            let tag = b[i + 1];
+            let start = i + 2;
+
+            // Find end of string: next 0x00 byte (including 00 C0)
+            let mut end = start;
+            while end < b.len() && b[end] != 0x00 {
+                end += 1;
+            }
+
+            let raw = &b[start..end];
+            let val = String::from_utf8_lossy(raw).trim().to_string();
+
+            // Skip empty and firmware-label values
+            let su = val.to_uppercase();
+            if !val.is_empty() && !su.contains("BOOT") && !su.starts_with("P B") {
+                match tag {
+                    0x01 => {
+                        // Tag 0x01 may be order code (starts with "6ES") or module type.
+                        if !val.starts_with("6ES") && module_type.is_empty() {
+                            module_type = val;
+                        }
+                    }
+                    0x05 => { if as_name.is_empty() { as_name = val; } }
+                    0x06 => { if serial_number.is_empty() { serial_number = val; } }
+                    0x07 => { if module_type.is_empty() { module_type = val; } }
+                    0x08 => { if module_name.is_empty() { module_name = val; } }
+                    _ => {}
+                }
+            }
+
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Also scan for free-standing printable strings that look like copyright
+    // (e.g. "Boot Loader" appearing after the tagged records).
+    if copyright.is_empty() {
+        let mut scan = 0;
+        while scan < b.len() {
+            if b[scan].is_ascii_graphic() || b[scan] == b' ' {
+                let s = scan;
+                while scan < b.len() && (b[scan].is_ascii_graphic() || b[scan] == b' ') {
+                    scan += 1;
+                }
+                let val = String::from_utf8_lossy(&b[s..scan]).trim().to_string();
+                let su = val.to_uppercase();
+                if val.len() >= 3 {
+                    if su.contains("BOOT") || su.starts_with("P B") {
+                        copyright = val;
+                        break;
+                    }
+                }
+            } else {
+                scan += 1;
+            }
+        }
+    }
+
+    (module_type, serial_number, as_name, copyright, module_name)
+}
+
+/// Determine the S7 protocol variant from the raw SZL payload and extracted module type.
+///
+/// - S7-1200/1500/ET200SP uses S7+ protocol: detected from the 0x00 0x01 record marker in the
+///   payload, or from a module_type containing `"15"` in its model number.
+/// - Everything else (S7-300, S7-400, S7-1200) uses classic S7 protocol.
+fn detect_protocol(_payload: &[u8], module_type: &str) -> crate::types::Protocol {
+    // S7+ protocol: S7-1200, S7-1500, ET 200SP CPU
+    // Classic S7: S7-300, S7-400
+    let upper = module_type.to_uppercase();
+    let is_s7plus = upper.contains("1500")
+        || upper.contains("1200")
+        || upper.contains("ET 200SP")
+        || upper.contains("ET200SP")
+        // "CPU 15xx" catches 1511, 1513, 1515, 1516, 1517, 1518
+        || (upper.contains("CPU") && {
+            let after_cpu = upper.find("CPU").map(|i| &upper[i+3..]).unwrap_or("");
+            let num: String = after_cpu.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+            matches!(num.get(..2), Some("12") | Some("15"))
+        });
+
+    if is_s7plus {
+        crate::types::Protocol::S7Plus
+    } else {
+        crate::types::Protocol::S7
+    }
+}
+
 
 /// Decode common S7 protocol error class/code pairs into human-readable descriptions.
 fn s7_error_description(ec: u8, ecd: u8) -> &'static str {
