@@ -1,6 +1,6 @@
 use std::io::Write;
-use anyhow::Result;
-use snap7_client::{transport::TcpTransport, types::BlockData, S7Client};
+use anyhow::{bail, Result};
+use snap7_client::{transport::TcpTransport, types::{BlockAttributes, BlockData}, S7Client};
 
 use crate::args::{BlockAction, BlockArgs};
 
@@ -58,6 +58,41 @@ pub async fn run(client: &S7Client<TcpTransport>, args: BlockArgs) -> Result<()>
                 println!("Uploaded {} {} ({} raw bytes) → {}", r#type, number, data.len(), out);
             }
         }
+        BlockAction::Download { r#type, number, file } => {
+            let bt = parse_block_type(&r#type)?;
+            let data = std::fs::read(&file)?;
+            client.download(bt, number, &data).await?;
+            println!("ok  – downloaded {} {} from {}", r#type.to_uppercase(), number, file);
+        }
+        BlockAction::CreateDb { number, size, author, family, name, version } => {
+            let attrs = BlockAttributes {
+                author,
+                family,
+                name,
+                version: parse_version_opt(version.as_deref())?,
+                flags: None,
+            };
+            client.create_db(number, size, Some(&attrs)).await?;
+            println!("ok  – created DB{} ({} bytes)", number, size);
+        }
+        BlockAction::SetAttrs { r#type, number, author, family, name, version } => {
+            let bt = parse_block_type(&r#type)?;
+            // Upload, modify, re-download
+            let raw = client.full_upload(bt, number).await?;
+            let mut block = BlockData::from_bytes(&raw)
+                .ok_or_else(|| anyhow::anyhow!("failed to parse block data"))?;
+            let attrs = BlockAttributes {
+                author,
+                family,
+                name,
+                version: parse_version_opt(version.as_deref())?,
+                flags: None,
+            };
+            block.set_attributes(&attrs);
+            let bytes = block.to_bytes();
+            client.download(bt, number, &bytes).await?;
+            println!("ok  – attributes updated on {}{}", r#type.to_uppercase(), number);
+        }
     }
     Ok(())
 }
@@ -76,7 +111,7 @@ fn block_type_label(t: u16) -> &'static str {
     }
 }
 
-fn parse_block_type(s: &str) -> Result<u8> {
+pub fn parse_block_type(s: &str) -> Result<u8> {
     Ok(match s.to_uppercase().as_str() {
         "OB" => 0x38,
         "DB" => 0x41,
@@ -85,6 +120,23 @@ fn parse_block_type(s: &str) -> Result<u8> {
         "SFC" => 0x44,
         "FB" => 0x45,
         "SFB" => 0x46,
-        _ => return Err(anyhow::anyhow!("unknown block type: {}. Use OB, DB, FC, FB, SFC, SFB, SDB", s)),
+        "UDT" => 0x47,
+        _ => bail!("unknown block type: {}. Use OB, DB, FC, FB, SFC, SFB, SDB, UDT", s),
     })
+}
+
+fn parse_version_opt(s: Option<&str>) -> Result<Option<u8>> {
+    let s = match s {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let parts: Vec<&str> = s.splitn(2, '.').collect();
+    let major: u8 = parts[0].parse().map_err(|_| anyhow::anyhow!("invalid version major: {s}"))?;
+    let minor: u8 = if parts.len() > 1 {
+        parts[1].parse().map_err(|_| anyhow::anyhow!("invalid version minor: {s}"))?
+    } else { 0 };
+    if major > 15 || minor > 15 {
+        bail!("version major and minor must each be 0–15");
+    }
+    Ok(Some((major << 4) | minor))
 }

@@ -36,7 +36,7 @@ async fn read_tag(
             .db_read(addr.db_number, addr.byte_offset, transport_size_bytes(addr.transport))
             .await
             .map_err(|e| anyhow::anyhow!("{}", e)),
-        Timer | Counter | Marker | ProcessInput | ProcessOutput | InstanceDB | LocalData => client
+        Timer | Counter | Marker | ProcessInput | ProcessOutput | PeripheralInput | InstanceDB | LocalData => client
             .read_area(
                 addr.area,
                 addr.db_number,

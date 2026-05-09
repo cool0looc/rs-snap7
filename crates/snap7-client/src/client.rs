@@ -823,8 +823,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
     pub async fn read_clock(&self) -> Result<PlcDateTime> {
         let mut inner = self.inner.lock().await;
         let pdu_ref = Self::next_pdu_ref(&mut inner);
+        // UserData params: head[3] + plen=4 + method=0x11(req) + Tg=0x47(clock) + subfn=0x01(read) + seq=0x00
         let mut param_buf = BytesMut::new();
-        param_buf.extend_from_slice(&[0x00, 0x01, 0x12, 0x04, 0xF5, 0x00]);
+        param_buf.extend_from_slice(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x47, 0x01, 0x00]);
         Self::send_s7(
             &mut inner,
             param_buf.freeze(),
@@ -834,19 +835,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         )
         .await?;
         let (_header, mut body) = Self::recv_s7(&mut inner).await?;
+        // Response body: 12-byte param echo + 4-byte data envelope [0xFF,0x09,0x00,0x08] + 8-byte datetime
+        // Skip everything except the last 8 bytes (datetime)
         if body.remaining() > 8 {
             body.advance(body.remaining() - 8);
         }
         Ok(PlcDateTime::decode(&mut body)?)
     }
 
-    /// Set the PLC clock (UserData subfunction 0x01 of function group 0xF5).
+    /// Set the PLC clock (UserData function group 0x47 = clock, subfunction 0x02 = write).
     pub async fn set_clock(&self, dt: &PlcDateTime) -> Result<()> {
         let mut inner = self.inner.lock().await;
         let pdu_ref = Self::next_pdu_ref(&mut inner);
-        // Param: method=0x11 (request), fn_group=0xF5 (clock), subfn=0x01 (set), param_len=0x08
+        // UserData params: head[3] + plen=4 + method=0x11(req) + Tg=0x47(clock) + subfn=0x02(write) + seq=0x00
         let mut param_buf = BytesMut::new();
-        param_buf.extend_from_slice(&[0x00, 0x01, 0x12, 0x08, 0xF5, 0x01]);
+        param_buf.extend_from_slice(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x47, 0x02, 0x00]);
         // Data envelope: return_code=0xFF, transport=0x09 (OCTET_STRING), length=8
         let mut data_buf = BytesMut::new();
         data_buf.extend_from_slice(&[0xFF, 0x09, 0x00, 0x08]);
@@ -915,6 +918,60 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         self.set_clock(&dt).await
     }
 
+    // -- Force operations ------------------------------------------------------
+
+    /// Force a bit in the process image output (Q) or process image input (I).
+    ///
+    /// `area` must be `Area::ProcessOutput` (Q) or `Area::ProcessInput` (I).
+    /// `byte_addr` is the byte address, `bit` is the bit number (0–7).
+    /// `value` is `true` to force to 1, `false` to force to 0.
+    ///
+    /// For outputs (Q): writes directly to the process image output — effective
+    /// on the next CPU scan cycle.  For inputs (I): writes to the process image
+    /// input — note that many CPUs will overwrite this on the next scan cycle
+    /// unless the CPU is in STOP mode or the input is truly "forced" via the
+    /// CPU's force table (STEP7 "Force Variables" function).
+    pub async fn force_bit(
+        &self,
+        area: Area,
+        byte_addr: u32,
+        bit: u8,
+        value: bool,
+    ) -> Result<()> {
+        let bit = bit & 0x07;
+        // Read the current byte, flip the target bit, write back.
+        let current = self.read_area(area, 0, byte_addr * 8, 1, TransportSize::Byte).await?;
+        let mut byte_val = if current.is_empty() { 0u8 } else { current[0] };
+        if value {
+            byte_val |= 1 << bit;
+        } else {
+            byte_val &= !(1 << bit);
+        }
+        self.write_area(area, 0, byte_addr * 8, TransportSize::Byte, &[byte_val]).await
+    }
+
+    /// Force a whole byte in the process image output (Q) or input (I).
+    pub async fn force_byte(
+        &self,
+        area: Area,
+        byte_addr: u32,
+        value: u8,
+    ) -> Result<()> {
+        self.write_area(area, 0, byte_addr * 8, TransportSize::Byte, &[value]).await
+    }
+
+    /// Cancel force on a byte by writing 0x00 to it.
+    pub async fn force_cancel_byte(&self, area: Area, byte_addr: u32) -> Result<()> {
+        self.write_area(area, 0, byte_addr * 8, TransportSize::Byte, &[0x00]).await
+    }
+
+    /// Read the SZL force table (SZL ID 0x0025) — returns raw SZL payload.
+    ///
+    /// Returns an empty `Bytes` when the CPU reports no forced variables.
+    pub async fn read_force_list(&self) -> Result<bytes::Bytes> {
+        self.read_szl_payload(0x0025, 0x0000).await
+    }
+
     /// Read the list of all available SZL IDs from the PLC (SZL ID 0x0000).
     ///
     /// Returns a `Vec<u16>` where each entry is a supported SZL ID.
@@ -975,6 +1032,71 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         let (header, _body) = Self::recv_s7(&mut inner).await?;
         check_plc_error(&header, "compress")?;
         Ok(())
+    }
+
+    // -- PI (Program Invocation) services -------------------------------------
+
+    /// Send an S7 PI (Program Invocation) Job — function 0x28.
+    ///
+    /// `service` is the PI service name (e.g. `"_MRES"`, `"_OVERALL_RESET"`).
+    /// The parameter block layout is: [0x28, 0x00, 0x00, len_hi, len_lo, <name bytes>].
+    async fn pi_service(inner: &mut Inner<T>, pdu_ref: u16, service: &str) -> Result<()> {
+        let name = service.as_bytes();
+        let mut param = BytesMut::with_capacity(5 + name.len());
+        param.put_u8(0x28); // function = PI service
+        param.put_u8(0x00);
+        param.put_u8(0x00);
+        param.put_u16(name.len() as u16);
+        param.extend_from_slice(name);
+        Self::send_s7(inner, param.freeze(), Bytes::new(), pdu_ref, PduType::Job).await?;
+        let (header, _body) = Self::recv_s7(inner).await?;
+        check_plc_error(&header, service)?;
+        Ok(())
+    }
+
+    /// Memory Reset — clears all work memory blocks.
+    ///
+    /// The PLC **must be in STOP mode** before calling this.  After memory reset
+    /// the CPU will no longer have any OBs, FBs, FCs or DBs; it must be
+    /// re-programmed before it can be restarted.
+    pub async fn memory_reset(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        Self::pi_service(&mut inner, pdu_ref, "_MRES").await
+    }
+
+    /// Overall Reset — formats the entire PLC memory (load + work + retain).
+    ///
+    /// More destructive than [`memory_reset`](Self::memory_reset): also wipes
+    /// the load memory (Flash/RAM card).  PLC must be in STOP mode.
+    pub async fn overall_reset(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        Self::pi_service(&mut inner, pdu_ref, "_OVERALL_RESET").await
+    }
+
+    // -- Batch block operations -----------------------------------------------
+
+    /// Upload all blocks of given types from the PLC.
+    ///
+    /// Returns a `Vec` of `(block_type, block_number, data)` tuples.
+    /// Pass `block_types` as a slice of raw type bytes, e.g.
+    /// `&[0x38, 0x41, 0x43, 0x45]` for OB, DB, FC, FB.
+    pub async fn upload_all_blocks(
+        &self,
+        block_types: &[u8],
+    ) -> Result<Vec<(u8, u16, Vec<u8>)>> {
+        let mut results = Vec::new();
+        for &bt in block_types {
+            let numbers = self.list_blocks_of_type(bt).await?;
+            for num in numbers {
+                match self.full_upload(bt, num).await {
+                    Ok(data) => results.push((bt, num, data)),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(results)
     }
 
     // -- PLC control & status -------------------------------------------------
@@ -2035,6 +2157,88 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         check_plc_error(&eheader, "download_end")?;
 
         Ok(())
+    }
+
+    /// Create a new empty DB on the PLC.
+    ///
+    /// Downloads a minimal zero-filled DB block.  The PLC must be in STOP mode
+    /// or support online DB creation (S7-400 / S7-1500).  If `attrs` is
+    /// `Some`, the block attributes are applied before download.
+    pub async fn create_db(
+        &self,
+        db_number: u16,
+        size_bytes: u16,
+        attrs: Option<&crate::types::BlockAttributes>,
+    ) -> Result<()> {
+        let mut block = crate::types::BlockData::new_db(db_number, size_bytes);
+        if let Some(a) = attrs {
+            block.set_attributes(a);
+        }
+        let bytes = block.to_bytes();
+        self.download(crate::types::BlockType::DB as u8, db_number, &bytes).await
+    }
+
+    /// Compare local block data against blocks currently on the PLC.
+    ///
+    /// For each `(block_type, block_number, local_bytes)` entry in `local`,
+    /// uploads the corresponding PLC block and compares CRC-32 checksums.
+    /// Also reports blocks that exist only on the PLC (missing locally) when
+    /// `report_plc_only` is `true`.
+    pub async fn compare_blocks(
+        &self,
+        local: &[(u8, u16, Vec<u8>)],
+        report_plc_only: bool,
+    ) -> Result<Vec<(u8, u16, crate::types::BlockCmpResult)>> {
+        use std::collections::HashMap;
+        use crate::types::{BlockCmpResult, BlockData};
+
+        // Build local lookup: (type, num) → crc32
+        let local_map: HashMap<(u8, u16), u32> = local
+            .iter()
+            .filter_map(|(bt, bn, bytes)| {
+                BlockData::from_bytes(bytes).map(|bd| ((*bt, *bn), bd.crc32()))
+            })
+            .collect();
+
+        let mut out = Vec::new();
+
+        // For each local block, upload PLC version and compare
+        for (bt, bn, local_bytes) in local {
+            let local_crc = match BlockData::from_bytes(local_bytes) {
+                Some(bd) => bd.crc32(),
+                None => continue,
+            };
+            match self.full_upload(*bt, *bn).await {
+                Ok(plc_bytes) => {
+                    let plc_crc = BlockData::from_bytes(&plc_bytes)
+                        .map(|bd| bd.crc32())
+                        .unwrap_or(0);
+                    let result = if local_crc == plc_crc {
+                        BlockCmpResult::Match
+                    } else {
+                        BlockCmpResult::Mismatch { local_crc, plc_crc }
+                    };
+                    out.push((*bt, *bn, result));
+                }
+                Err(_) => {
+                    out.push((*bt, *bn, BlockCmpResult::OnlyLocal));
+                }
+            }
+        }
+
+        // Report PLC-only blocks
+        if report_plc_only {
+            for bt in &[0x38u8, 0x41, 0x43, 0x45] {
+                let numbers = self.list_blocks_of_type(*bt).await?;
+                for num in numbers {
+                    if !local_map.contains_key(&(*bt, num)) {
+                        out.push((*bt, num, BlockCmpResult::OnlyPlc));
+                    }
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     /// Fill a DB with a constant byte value.

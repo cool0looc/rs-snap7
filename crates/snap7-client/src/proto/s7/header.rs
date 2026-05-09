@@ -28,6 +28,8 @@ impl TryFrom<u8> for PduType {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum Area {
+    // Direct peripheral access — bypasses process image, used for force operations
+    PeripheralInput = 0x80,
     ProcessInput = 0x81,
     ProcessOutput = 0x82,
     Marker = 0x83,
@@ -42,6 +44,7 @@ impl TryFrom<u8> for Area {
     type Error = ProtoError;
     fn try_from(v: u8) -> Result<Self, ProtoError> {
         match v {
+            0x80 => Ok(Area::PeripheralInput),
             0x81 => Ok(Area::ProcessInput),
             0x82 => Ok(Area::ProcessOutput),
             0x83 => Ok(Area::Marker),

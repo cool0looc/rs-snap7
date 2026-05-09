@@ -53,8 +53,10 @@ pub enum Command {
     Write(WriteArgs),
     /// Read/write typed tags (e.g. DB1,REAL4)
     Tag(TagArgs),
-    /// Block operations: list, info, upload
+    /// Block operations: list, info, upload, download, create, compare
     Block(BlockArgs),
+    /// Memory and program management: reset, format, batch-upload, compare
+    Program(ProgramArgs),
     /// Query SZL (system status list)
     Szl(SzlArgs),
     /// Quick connectivity test
@@ -67,6 +69,10 @@ pub enum Command {
     Info(InfoArgs),
     /// Set or clear the session password
     Password(PasswordArgs),
+    /// Read or set the PLC real-time clock
+    Clock(ClockArgs),
+    /// Force I/Q bits or bytes to a value (bypasses normal scan cycle)
+    Force(ForceArgs),
     #[cfg(feature = "opcua")]
     /// Start the OPC-UA gateway server
     Serve(ServeArgs),
@@ -183,6 +189,50 @@ pub enum BlockAction {
         #[arg(long)]
         out: String,
     },
+    /// Download a block from file to PLC
+    Download {
+        #[arg(long)]
+        r#type: String,
+        #[arg(long)]
+        number: u16,
+        #[arg(long)]
+        file: String,
+    },
+    /// Create a new empty DB on the PLC
+    CreateDb {
+        #[arg(long)]
+        number: u16,
+        /// Size in bytes
+        #[arg(long, default_value = "256")]
+        size: u16,
+        /// Author attribute (max 8 chars)
+        #[arg(long)]
+        author: Option<String>,
+        /// Family attribute (max 8 chars)
+        #[arg(long)]
+        family: Option<String>,
+        /// Name attribute (max 8 chars)
+        #[arg(long)]
+        name: Option<String>,
+        /// Version as major.minor (e.g. 1.0)
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Set block attributes (author, family, name, version) — re-downloads block
+    SetAttrs {
+        #[arg(long)]
+        r#type: String,
+        #[arg(long)]
+        number: u16,
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        family: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        version: Option<String>,
+    },
 }
 
 // --- SZL ---
@@ -275,6 +325,102 @@ pub enum PasswordAction {
     Set { password: String },
     /// Clear session password
     Clear,
+}
+
+// --- Clock ---
+
+#[derive(clap::Args, Debug)]
+pub struct ClockArgs {
+    #[command(subcommand)]
+    pub action: ClockAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClockAction {
+    /// Read PLC real-time clock
+    Read,
+    /// Set PLC clock to a specific date/time (format: YYYY-MM-DDTHH:MM:SS)
+    Set {
+        datetime: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sync PLC clock to system time
+    Sync {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+// --- Program ---
+
+#[derive(clap::Args, Debug)]
+pub struct ProgramArgs {
+    #[command(subcommand)]
+    pub action: ProgramAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProgramAction {
+    /// Memory reset — clears work memory (PLC must be in STOP)
+    MemReset {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Overall reset — formats entire PLC memory (PLC must be in STOP)
+    Format {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Upload all blocks of given types to a directory
+    BatchUpload {
+        /// Block types: comma-separated list of OB,FB,FC,DB,SFC,SFB,UDT (default: all)
+        #[arg(long, default_value = "OB,FB,FC,DB")]
+        types: String,
+        /// Output directory
+        #[arg(long, default_value = ".")]
+        out: String,
+        /// Use full-upload (includes MC7 code); default is header-only upload
+        #[arg(long, default_value_t = false)]
+        full: bool,
+    },
+    /// Compare local block files to PLC — reports CRC mismatches
+    Compare {
+        /// Directory containing local block files (named <TYPE><NUM>.bin)
+        #[arg(long)]
+        dir: String,
+        /// Also report blocks that exist on PLC but not locally
+        #[arg(long, default_value_t = false)]
+        plc_only: bool,
+    },
+}
+
+// --- Force ---
+
+#[derive(clap::Args, Debug)]
+pub struct ForceArgs {
+    #[command(subcommand)]
+    pub action: ForceAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ForceAction {
+    /// Set a bit or byte: I0.3=1, Q1.0=0, IB2=0xFF, QB0=0x00
+    Set {
+        /// Address: I<byte>.<bit>, Q<byte>.<bit>, IB<byte>, QB<byte>
+        address: String,
+        /// Value: 0 or 1 for bits; 0–255 or 0x00–0xFF for bytes
+        value: String,
+    },
+    /// Cancel force by writing 0 to address: IB0, QB1
+    Cancel {
+        /// Address: IB<byte> or QB<byte>
+        address: String,
+    },
+    /// List forced variables (SZL 0x0025)
+    List,
 }
 
 // --- Serve ---

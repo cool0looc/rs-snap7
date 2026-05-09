@@ -1,5 +1,8 @@
 pub mod block;
+pub mod clock;
 pub mod diag;
+pub mod force;
+pub mod program;
 pub mod info;
 pub mod password;
 pub mod plc_control;
@@ -63,6 +66,9 @@ pub async fn run() -> Result<()> {
         Command::PlcControl(args) => plc_control::run(&client, args).await?,
         Command::Info(args) => info::run(&client, args).await?,
         Command::Password(args) => password::run(&client, args).await?,
+        Command::Clock(args) => clock::run(&client, args).await?,
+        Command::Force(args) => force::run(&client, args).await?,
+        Command::Program(args) => program::run(&client, args).await?,
         #[cfg(feature = "opcua")]
         Command::Serve(_) => unreachable!(), // Handled above
     }

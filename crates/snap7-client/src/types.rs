@@ -182,6 +182,21 @@ pub struct BlockData {
     pub payload: Vec<u8>,
 }
 
+/// Attributes that can be set on a block header.
+#[derive(Debug, Clone, Default)]
+pub struct BlockAttributes {
+    /// Author string (max 8 chars, padded with spaces).
+    pub author: Option<String>,
+    /// Family string (max 8 chars, padded with spaces).
+    pub family: Option<String>,
+    /// Header/name string (max 8 chars, padded with spaces).
+    pub name: Option<String>,
+    /// Version (major.minor encoded as `(major << 4) | minor`).
+    pub version: Option<u8>,
+    /// Block flags (overrides existing flags word).
+    pub flags: Option<u16>,
+}
+
 impl BlockData {
     /// Parse raw uploaded bytes into a `BlockData`.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
@@ -223,6 +238,134 @@ impl BlockData {
         buf.extend_from_slice(&self.payload);
         buf
     }
+
+    /// Build a minimal empty DB block ready for download.
+    ///
+    /// Creates a Diagra-format block with the S7 DB header structure.
+    /// `size_bytes` is the desired DB size in bytes (must be even).
+    pub fn new_db(db_number: u16, size_bytes: u16) -> Self {
+        // Minimal S7 DB block payload: 2-byte "actual size" + zero data
+        let size = (size_bytes as usize + 1) & !1; // round up to even
+        let mut payload = Vec::with_capacity(2 + size);
+        payload.extend_from_slice(&(size as u16).to_be_bytes());
+        payload.extend(std::iter::repeat(0u8).take(size));
+        let total_length = (20 + payload.len()) as u32;
+        BlockData {
+            block_type: BlockType::DB as u16,
+            block_number: db_number,
+            format: 0x0001,
+            total_length,
+            flags: 0x0000,
+            crc1: 0x0000,
+            crc2: 0x0000,
+            payload,
+        }
+    }
+
+    /// Compute a CRC-32 checksum of the serialized block bytes.
+    ///
+    /// Suitable for comparing a locally stored block against one uploaded
+    /// from the PLC: `local.crc32() == plc_block.crc32()`.
+    pub fn crc32(&self) -> u32 {
+        let bytes = self.to_bytes();
+        crc32_ieee(&bytes)
+    }
+
+    /// Apply [`BlockAttributes`] to this block in-place.
+    ///
+    /// The S7 block footer is at `payload[payload.len()-48..]` (when payload
+    /// is large enough).  Author/Family/Name each occupy 8 bytes at fixed
+    /// offsets within the footer.
+    pub fn set_attributes(&mut self, attrs: &BlockAttributes) {
+        if let Some(f) = attrs.flags {
+            self.flags = f;
+        }
+        // Footer is last 48 bytes of payload (S7 block structure)
+        let plen = self.payload.len();
+        if plen < 48 {
+            return;
+        }
+        let footer = &mut self.payload[plen - 48..];
+        // Footer layout (S7 standard):
+        //   [0..8]   reserved
+        //   [8..16]  author (8 bytes, space-padded)
+        //   [16..24] family (8 bytes, space-padded)
+        //   [24..32] name/header (8 bytes, space-padded)
+        //   [32]     version byte
+        //   [33..48] reserved/checksum
+        if let Some(ref s) = attrs.author {
+            write_padded(&mut footer[8..16], s);
+        }
+        if let Some(ref s) = attrs.family {
+            write_padded(&mut footer[16..24], s);
+        }
+        if let Some(ref s) = attrs.name {
+            write_padded(&mut footer[24..32], s);
+        }
+        if let Some(v) = attrs.version {
+            footer[32] = v;
+        }
+    }
+
+    /// Return the human-readable block type name.
+    pub fn type_name(&self) -> &'static str {
+        block_type_name(self.block_type as u8)
+    }
+}
+
+pub fn block_type_name(bt: u8) -> &'static str {
+    match bt {
+        0x38 => "OB",
+        0x41 => "DB",
+        0x42 => "SDB",
+        0x43 => "FC",
+        0x44 => "SFC",
+        0x45 => "FB",
+        0x46 => "SFB",
+        0x47 => "UDT",
+        _ => "??",
+    }
+}
+
+fn write_padded(dst: &mut [u8], s: &str) {
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(dst.len());
+    dst[..n].copy_from_slice(&bytes[..n]);
+    for b in dst[n..].iter_mut() {
+        *b = b' ';
+    }
+}
+
+// CRC-32 (IEEE 802.3 polynomial 0xEDB88320) — no external dep needed.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+/// Compare two block lists: local files vs PLC blocks.
+///
+/// Each entry is `(block_type, block_number)` in `local`; the closure
+/// `plc_crc` is called for each to retrieve the PLC-side CRC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockCmpResult {
+    /// Identical CRC — block matches.
+    Match,
+    /// CRC differs — block has been modified on the PLC.
+    Mismatch { local_crc: u32, plc_crc: u32 },
+    /// Block exists locally but not on the PLC.
+    OnlyLocal,
+    /// Block exists on the PLC but not locally.
+    OnlyPlc,
 }
 
 /// Detailed information about a PLC block, returned by

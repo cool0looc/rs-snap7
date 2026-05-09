@@ -22,9 +22,11 @@ pub use pool::{PoolConfig, PooledClient, S7Pool};
 pub use proto::ProtoError;
 pub use tag::{parse_tag, TagAddress};
 pub use tls::{tls_connect, TlsStream};
+pub use proto::s7::clock::PlcDateTime;
 pub use types::{
-    BlockData, BlockInfo, BlockList, BlockListEntry, BlockType, ConnectParams, CpuInfo, CpInfo,
-    ModuleEntry, OrderCode, PlcStatus, Protocol, Protection,
+    block_type_name, BlockAttributes, BlockCmpResult, BlockData, BlockInfo, BlockList,
+    BlockListEntry, BlockType, ConnectParams, CpuInfo, CpInfo, ModuleEntry, OrderCode, PlcStatus,
+    Protocol, Protection,
 };
 pub use types::encrypt_password;
 pub use udp::UdpTransport;

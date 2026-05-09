@@ -15,16 +15,23 @@ Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates w
 | **Connection pool** | ✅ |
 | **Multi-read / multi-write** with automatic PDU batching | ✅ |
 | **PLC control** — stop, hot-start, cold-start, status (via SZL 0x0424) | ✅ |
+| **Memory management** — memory reset (`_MRES`), overall reset (`_OVERALL_RESET`) | ✅ |
 | **PLC information** — order code, CPU info, CP info, module list | ✅ |
-| **Block operations** — list, numbers, info, upload, full-upload, download, delete, fill, get | ✅ |
+| **Block operations** — list, numbers, info, upload, full-upload, download, delete, fill, get, create DB | ✅ |
+| **Block attributes** — set author, family, name, version on any block | ✅ |
+| **Batch block upload** — upload all OB/FB/FC/DB in one call | ✅ |
+| **Block CRC compare** — diff local block files against PLC (CRC-32) | ✅ |
 | **Session password** — set, clear, read protection level | ✅ |
 | **SZL queries** — system status list, SZL directory | ✅ |
 | **PLC clock** — read and write (set clock, sync to host time) | ✅ |
 | **Merker / Process I/O** — `mb_read/write`, `eb_read/write`, `ib_read/write` | ✅ |
 | **Timer / Counter** — `tm_read/write`, `ct_read/write` | ✅ |
+| **Force I/O** — force bits/bytes in I/Q areas, cancel force, read force list (SZL 0x0025) | ✅ |
 | **PDU length query** | ✅ |
 | **Copy RAM → ROM, compress memory** | ✅ |
-| **CLI** — typed tags (DB/Merker/Timer/Counter), multi-format output (text/json/csv) | ✅ |
+| **Reconnect** — re-establish TCP + S7 handshake in-place | ✅ |
+| **Exec time** — round-trip timing per command (ms) | ✅ |
+| **CLI** — typed tags, block mgmt, clock, force, program compare, multi-format output | ✅ |
 | **OPC-UA gateway** with subscription support | ✅ |
 | **In-process PLC simulator** — data store, area lock/unlock, CPU state, event queue, callbacks | ✅ |
 | **S7 Partner** (BSend/BRecv peer-to-peer, active + passive) | ✅ |
@@ -101,13 +108,23 @@ Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates w
 | `Cli_CopyRamToRom` | `copy_ram_to_rom()` | ✅ |
 | `Cli_Compress` | `compress()` | ✅ |
 | `Cli_GetPduLength` | `get_pdu_length()` | ✅ |
-| `Cli_GetExecTime` | `get_exec_time()` → ms since last send | ✅ |
+| `Cli_GetExecTime` | `get_exec_time()` → ms since last send/recv | ✅ |
 | `Cli_GetLastError` | Rust `Result<T, Error>` | ✅ |
 | `Cli_ErrorText` | `Error::to_string()` | ✅ |
 | `Cli_IsoExchangeBuffer` | — (raw PDU exchange) | ❌ |
 | `Cli_As*` (all async variants) | native `async fn` everywhere | ✅ |
 | `Cli_WaitAsCompletion` / `Cli_CheckAsCompletion` | `.await` | ✅ |
 | `Cli_SetAsCallback` | `.await` / tokio tasks | ✅ |
+| — (no C equivalent) | `memory_reset()` — PI service `_MRES` | ✅ |
+| — (no C equivalent) | `overall_reset()` — PI service `_OVERALL_RESET` | ✅ |
+| — (no C equivalent) | `force_bit(area, byte, bit, value)` | ✅ |
+| — (no C equivalent) | `force_byte(area, byte, value)` | ✅ |
+| — (no C equivalent) | `force_cancel_byte(area, byte)` | ✅ |
+| — (no C equivalent) | `read_force_list()` — SZL 0x0025 | ✅ |
+| — (no C equivalent) | `upload_all_blocks(&[types])` — batch upload | ✅ |
+| — (no C equivalent) | `create_db(num, size, attrs)` | ✅ |
+| — (no C equivalent) | `compare_blocks(local, report_plc_only)` — CRC-32 diff | ✅ |
+| — (no C equivalent) | `BlockData::set_attributes(attrs)` — author/family/name/version | ✅ |
 
 ### Server API (`Srv_*`)
 
@@ -162,10 +179,44 @@ Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates w
 | TLS transport (S7CommPlus encrypted) | `snap7-client` |
 | UDP transport | `snap7-client` |
 | Connection pool with max-size semaphore | `snap7-client` |
+| Memory reset / overall reset (PI services) | `snap7-client` |
+| Force I/O bits and bytes (I/Q areas) | `snap7-client` |
+| Batch block upload (all OB/FB/FC/DB in one call) | `snap7-client` |
+| Create DB with custom size and attributes | `snap7-client` |
+| Block CRC-32 compare (local vs PLC) | `snap7-client` |
+| Block attribute editing (author/family/name/version) | `snap7-client` |
+| Reconnect in-place (TCP + S7 handshake) | `snap7-client` |
+| Per-command exec time (ms, send→recv) | `snap7-client` |
 | OPC-UA gateway with subscriptions | `snap7-opcua-gateway` |
 | Typed tag parser (DB/M/T/C address syntax) | `snap7-cli` |
 | CLI with JSON/CSV/text output | `snap7-cli` |
+| CLI clock — read/set/sync with --force | `snap7-cli` |
+| CLI force — set/cancel I/Q bits and bytes, list | `snap7-cli` |
+| CLI program — mem-reset, format, batch-upload, compare | `snap7-cli` |
 | Fully async — no blocking thread per connection | all crates |
+
+---
+
+## Protocol analysis — known gaps
+
+The following S7 protocol features exist in the standard or in C snap7 but are **not yet implemented**:
+
+| Feature | Protocol detail | Priority |
+|---|---|---|
+| `Cli_IsoExchangeBuffer` | Raw PDU exchange — sends arbitrary TPDU, receives response | Low |
+| `Par_GetTimes` | Per-direction BSend/BRecv timing statistics | Low |
+| **True force table** (persistent I forcing) | CPU force table via UserData `grProgram` — allows forcing inputs that persist across scan cycles | Medium |
+| **SZL 0x0092** (diagnostic buffer) | Reads the CPU diagnostic ring buffer (fault entries) | Medium |
+| **SZL 0x0111** (module status) | Returns installed module count and status per slot | Low |
+| **SZL 0x0B00** / **0x0B01** (communication status) | Connection table, active sessions per rack/slot | Low |
+| **PI service `_WRK_COMPRESS`** | Another memory compress variant (supplement to `Cli_Compress`) | Low |
+| **PI service `_INSMOD` / `_DELMOD`** | Insert / delete modules (S7-400 hardware config) | Low |
+| **Multi-block download** | Download multiple blocks in one S7 session without reconnect | Medium |
+| **Block existence check** | Lightweight "does block X exist?" without full info query | Low |
+| **Online block modification** | Modify a running DB online (S7-400/1500 only) | Low |
+| **S7CommPlus multi-read** | Batch reads in S7+ protocol (S7-1500 integrity mode) | Medium |
+| **UDT / SDB upload** | Upload user-defined types and system DBs | Low |
+| **Force via peripheral area (0x80)** | `Area::PeripheralInput` write — direct hardware register access | Medium |
 
 ---
 
@@ -238,6 +289,26 @@ snap7 -H 192.168.1.100 block list
 snap7 -H 192.168.1.100 block numbers --type DB
 snap7 -H 192.168.1.100 block info --type DB --number 1
 snap7 -H 192.168.1.100 block upload --type DB --number 1 --out db1.bin
+snap7 -H 192.168.1.100 block download --type DB --number 1 --file db1.bin
+snap7 -H 192.168.1.100 block create-db --number 50 --size 512 --author Kyle --family MYAPP --version 1.0
+snap7 -H 192.168.1.100 block set-attrs --type DB --number 50 --author Kyle --version 2.0
+
+# Program management
+snap7 -H 192.168.1.100 program batch-upload --types OB,FB,FC,DB --out ./blocks --full
+snap7 -H 192.168.1.100 program compare --dir ./blocks --plc-only
+snap7 -H 192.168.1.100 program mem-reset --force     # clears work memory (PLC must STOP)
+snap7 -H 192.168.1.100 program format --force        # full memory wipe
+
+# PLC clock
+snap7 -H 192.168.1.100 clock read
+snap7 -H 192.168.1.100 clock set 2025-01-15T10:30:00 --force
+snap7 -H 192.168.1.100 clock sync --force            # sync to system time
+
+# Force I/O
+snap7 -H 192.168.1.100 force set Q0.3 1             # force output bit
+snap7 -H 192.168.1.100 force set QB2 0xFF           # force output byte
+snap7 -H 192.168.1.100 force cancel QB0             # cancel force
+snap7 -H 192.168.1.100 force list                   # SZL 0x0025 force table
 
 # Query SZL (system status list)
 snap7 -H 192.168.1.100 szl --id 0x0011 --index 0
@@ -444,6 +515,10 @@ client.plc_stop().await?;
 client.plc_hot_start().await?;
 client.plc_cold_start().await?;
 
+// Memory management (PLC must be in STOP)
+client.memory_reset().await?;     // clears work memory
+client.overall_reset().await?;   // wipes load + work + retain
+
 // Identity
 let oc = client.get_order_code().await?;    // e.g. "6ES7 317-2EK14-0AB0"
 let ci = client.get_cpu_info().await?;
@@ -472,6 +547,56 @@ let mc7     = client.full_upload(0x41, 1).await?;          // with MC7 code
 client.download(0x41, 1, &data).await?;
 client.delete_block(0x41, 1).await?;
 client.db_fill(1, 0x00).await?;
+
+// Create empty DB with attributes
+use snap7_client::BlockAttributes;
+let attrs = BlockAttributes {
+    author: Some("Kyle".into()),
+    family: Some("MYAPP".into()),
+    name: Some("Config".into()),
+    version: Some(0x10),  // 1.0
+    flags: None,
+};
+client.create_db(50, 512, Some(&attrs)).await?;
+
+// Batch upload all OB/FB/FC/DB
+let all = client.upload_all_blocks(&[0x38, 0x45, 0x43, 0x41]).await?;
+for (bt, num, data) in &all {
+    println!("{}{}: {} bytes", snap7_client::block_type_name(*bt), num, data.len());
+}
+
+// CRC-32 compare local files vs PLC
+let local = vec![(0x41u8, 1u16, std::fs::read("DB1.bin")?)];
+let results = client.compare_blocks(&local, true).await?;
+for (bt, num, result) in results {
+    println!("{}{}: {:?}", snap7_client::block_type_name(bt), num, result);
+}
+
+// Set block attributes (upload → modify → re-download)
+use snap7_client::BlockData;
+let raw = client.full_upload(0x41, 1).await?;
+if let Some(mut block) = BlockData::from_bytes(&raw) {
+    block.set_attributes(&attrs);
+    client.download(0x41, 1, &block.to_bytes()).await?;
+}
+```
+
+### Force I/O
+
+```rust
+use snap7_client::proto::s7::header::Area;
+
+// Force output Q0.3 = 1
+client.force_bit(Area::ProcessOutput, 0, 3, true).await?;
+
+// Force entire output byte QB2 = 0xFF
+client.force_byte(Area::ProcessOutput, 2, 0xFF).await?;
+
+// Cancel force on QB0
+client.force_cancel_byte(Area::ProcessOutput, 0).await?;
+
+// Read force table (SZL 0x0025)
+let force_data = client.read_force_list().await?;
 ```
 
 ### Session password & protection

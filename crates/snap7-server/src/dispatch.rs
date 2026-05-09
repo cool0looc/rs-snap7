@@ -91,7 +91,8 @@ where
             }
             PduType::UserData => {
                 // UserData: SZL, clock, block info, etc.
-                if payload.len() >= 5 && (payload[4] == 0x11 || payload[4] == 0xF5) {
+                // payload[4] = method byte: 0x11 = UserData request
+                if payload.len() >= 5 && payload[4] == 0x11 {
                     handle_user_data(&mut transport, header.pdu_ref, &payload).await?;
                 } else {
                     send_simple_ack(&mut transport, header.pdu_ref).await?;
