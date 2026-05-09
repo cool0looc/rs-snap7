@@ -98,8 +98,55 @@ snap7 -H 192.168.1.100 block numbers --type OB
 # Show detailed info for a block
 snap7 -H 192.168.1.100 block info --type DB --number 1
 
-# Upload a block to file
+# Upload / download a block
 snap7 -H 192.168.1.100 block upload --type DB --number 1 --out db1.bin
+snap7 -H 192.168.1.100 block download --type DB --number 1 --file db1.bin
+
+# Create a new empty DB
+snap7 -H 192.168.1.100 block create-db --number 50 --size 512 --author Kyle --family MYAPP --version 1.0
+
+# Update block attributes (author/family/name/version)
+snap7 -H 192.168.1.100 block set-attrs --type DB --number 50 --author Kyle --version 2.0
+```
+
+### program — memory and program management
+
+```bash
+# Batch-upload all blocks of given types to a directory
+snap7 -H 192.168.1.100 program batch-upload --types OB,FB,FC,DB --out ./blocks --full
+
+# Compare local .bin block files against PLC (CRC-32)
+snap7 -H 192.168.1.100 program compare --dir ./blocks --plc-only
+
+# Memory reset — clears work memory (PLC must be in STOP)
+snap7 -H 192.168.1.100 program mem-reset --force
+
+# Overall reset — wipes load + work + retain memory (PLC must be in STOP)
+snap7 -H 192.168.1.100 program format --force
+```
+
+### clock — PLC real-time clock
+
+```bash
+snap7 -H 192.168.1.100 clock read
+snap7 -H 192.168.1.100 clock set 2025-05-09T14:30:00 --force
+snap7 -H 192.168.1.100 clock sync --force    # sync PLC clock to system time
+```
+
+### force — force I/O bits and bytes
+
+```bash
+# Force output bit Q0.3 = 1
+snap7 -H 192.168.1.100 force set Q0.3 1
+
+# Force output byte QB2 = 0xFF
+snap7 -H 192.168.1.100 force set QB2 0xFF
+
+# Cancel force on QB0
+snap7 -H 192.168.1.100 force cancel QB0
+
+# List forced variables (SZL 0x0025)
+snap7 -H 192.168.1.100 force list
 ```
 
 ### szl — query system status list

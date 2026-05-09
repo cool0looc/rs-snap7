@@ -15,12 +15,21 @@ Part of the [rs-snap7](https://github.com/cool0looc/rs-snap7) workspace.
 | **Typed tag addressing** — DB, Merker, Timer, Counter | ✅ |
 | **Tag read/write** with type decoding/encoding | ✅ |
 | **Area absolute addressing** — `read_area` / `write_area` for any area | ✅ |
-| **Block operations** — list, numbers, info, upload, download, delete, fill | ✅ |
+| **Block operations** — list, numbers, info, upload, full-upload, download, delete, fill, get | ✅ |
+| **Block attributes** — set author, family, name, version on any block | ✅ |
+| **Batch block upload** — upload all OB/FB/FC/DB in one call | ✅ |
+| **Block CRC compare** — diff local `.bin` files against PLC (CRC-32) | ✅ |
+| **Create DB** — create empty DB with custom size and attributes | ✅ |
 | **PLC control** — stop, hot-start, cold-start, status (SZL 0x0424) | ✅ |
+| **Memory management** — memory reset (`_MRES`), overall reset (`_OVERALL_RESET`) | ✅ |
 | **PLC information** — order code, CPU info, CP info, module list | ✅ |
 | **Session password** — set, clear, read protection level | ✅ |
-| **SZL queries** — system status list, clock, protection | ✅ |
+| **SZL queries** — system status list, SZL directory | ✅ |
+| **PLC clock** — read and write (set clock, sync to host time) | ✅ |
+| **Force I/O** — force bits/bytes in I/Q areas, cancel force, read force list (SZL 0x0025) | ✅ |
 | **Copy RAM → ROM, compress memory** | ✅ |
+| **Reconnect** — re-establish TCP + S7 handshake in-place | ✅ |
+| **Exec time** — round-trip timing per command (ms) | ✅ |
 | **TLS transport** (S7CommPlus encrypted via `tokio-rustls`) | ✅ |
 | **UDP transport** | ✅ |
 | **Sync (blocking) API** — via `sync` feature | ✅ |

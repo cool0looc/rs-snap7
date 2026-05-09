@@ -33,7 +33,7 @@ Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates w
 | **Exec time** — round-trip timing per command (ms) | ✅ |
 | **CLI** — typed tags, block mgmt, clock, force, program compare, multi-format output | ✅ |
 | **OPC-UA gateway** with subscription support | ✅ |
-| **In-process PLC simulator** — data store, area lock/unlock, CPU state, event queue, callbacks | ✅ |
+| **In-process PLC simulator** — data store, area lock/unlock, CPU state, clock, event queue, callbacks | ✅ |
 | **S7 Partner** (BSend/BRecv peer-to-peer, active + passive) | ✅ |
 
 ## Workspace crates
@@ -146,6 +146,7 @@ Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates w
 | `Srv_SetEventsCallback` | `store.on_event(cb)` | ✅ |
 | `Srv_SetReadEventsCallback` | `store.on_read(cb)` | ✅ |
 | `Srv_SetRWAreaCallback` | `store.on_write(cb)` | ✅ |
+| — (no C equivalent) | `store.get_clock()` / `store.set_clock(bytes)` — simulated RTC | ✅ |
 | `Srv_GetParam` / `Srv_SetParam` | `ServerConfig` struct | ✅ |
 | `Srv_ErrorText` / `Srv_EventText` | `Error::to_string()` | ✅ |
 
@@ -361,6 +362,11 @@ snap7-test-server
 # Terminal 2 — read from it
 snap7 -H 127.0.0.1 -p 10200 read --db 1 --offset 0 --size 4
 # → DE AD BE EF
+
+# Clock operations against the simulator
+snap7 -H 127.0.0.1 -p 10200 clock read       # → 2000-00-00T00:00:00.000 (unset)
+snap7 -H 127.0.0.1 -p 10200 clock sync --force
+snap7 -H 127.0.0.1 -p 10200 clock read       # → current system time
 ```
 
 ### Tag address syntax
@@ -637,6 +643,10 @@ store.set_mask(0xFFFF_FFFF);
 if let Some(ev) = store.pick_event() {
     println!("{}: area=0x{:02X}", ev.event, ev.area);
 }
+
+// Clock
+let clock_bytes = store.get_clock();          // [u8; 8] BCD DATE_AND_TIME
+store.set_clock([0x25, 0x05, 0x09, 0x14, 0x30, 0x00, 0x00, 0x05]); // 2025-05-09 14:30:00 Fri
 
 // Status
 let status = S7Server::get_status(&store);

@@ -10,9 +10,15 @@ Part of the [rs-snap7](https://github.com/cool0looc/rs-snap7) workspace.
 |---|---|
 | **S7Comm read/write dispatch** — handles `ReadVar` / `WriteVar` requests | ✅ |
 | **Multi-item read/write** — single-PDU multi-area operations | ✅ |
+| **SZL dispatch** — responds to SZL queries (0x0011, 0x001C, 0x0131, 0x0424, 0x0032) | ✅ |
+| **PLC control dispatch** — stop, hot-start, cold-start, status | ✅ |
+| **Clock dispatch** — responds to clock read/write (UserData group 0x47) | ✅ |
 | **DataStore** — thread-safe in-memory store by `(area, db, offset)` | ✅ |
+| **Simulated RTC** — `get_clock()` / `set_clock()` for clock read/write | ✅ |
 | **Area registration** — PI, PA, MK, DB, timer, counter, etc. | ✅ |
+| **Area lock/unlock** — writes to locked areas are silently ignored | ✅ |
 | **CPU state tracking** — RUN / STOP with state-change callbacks | ✅ |
+| **Event queue** — `pick_event()`, `set_mask()`, `clear_events()` | ✅ |
 | **Read / write event callbacks** | ✅ |
 | **Max connections limit** | ✅ |
 | **Ephemeral port support** — `127.0.0.1:0` for tests | ✅ |
@@ -77,8 +83,8 @@ tokio::spawn(server.serve(store));
 ## Notes
 
 - Implements TPKT / COTP / S7Comm handshake and dispatch.
-- Supports multi-item read/write (`ReadVar` / `WriteVar`).
-- Does not implement S7CommPlus, SZL, or block upload — those return protocol errors.
+- Supports multi-item read/write (`ReadVar` / `WriteVar`), SZL queries, PLC control, and clock read/write.
+- Does not implement S7CommPlus or block upload — those return protocol errors.
 
 ## License
 
