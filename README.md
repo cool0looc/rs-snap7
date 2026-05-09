@@ -2,7 +2,7 @@
 
 Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates with S7-300/400/1200/1500 PLCs over ISO-on-TCP without any native C dependency.
 
-> **Status:** v0.1.6 — functional, pre-1.0. API may change.
+> **Status:** v0.1.7 — functional, pre-1.0. API may change.
 
 ## Features
 
@@ -16,23 +16,156 @@ Pure-Rust, async implementation of the Siemens S7 protocol stack. Communicates w
 | **Multi-read / multi-write** with automatic PDU batching | ✅ |
 | **PLC control** — stop, hot-start, cold-start, status (via SZL 0x0424) | ✅ |
 | **PLC information** — order code, CPU info, CP info, module list | ✅ |
-| **Block operations** — list, numbers, info, upload, download, delete, fill | ✅ |
+| **Block operations** — list, numbers, info, upload, full-upload, download, delete, fill, get | ✅ |
 | **Session password** — set, clear, read protection level | ✅ |
-| **SZL queries** — system status list | ✅ |
-| **PLC clock read** | ✅ |
+| **SZL queries** — system status list, SZL directory | ✅ |
+| **PLC clock** — read and write (set clock, sync to host time) | ✅ |
+| **Merker / Process I/O** — `mb_read/write`, `eb_read/write`, `ib_read/write` | ✅ |
+| **Timer / Counter** — `tm_read/write`, `ct_read/write` | ✅ |
+| **PDU length query** | ✅ |
 | **Copy RAM → ROM, compress memory** | ✅ |
 | **CLI** — typed tags (DB/Merker/Timer/Counter), multi-format output (text/json/csv) | ✅ |
 | **OPC-UA gateway** with subscription support | ✅ |
-| **In-process PLC simulator** with data store, callbacks, CPU state | ✅ |
+| **In-process PLC simulator** — data store, area lock/unlock, CPU state, event queue, callbacks | ✅ |
+| **S7 Partner** (BSend/BRecv peer-to-peer, active + passive) | ✅ |
 
 ## Workspace crates
 
 | Crate | Description |
 |---|---|
 | [`snap7-client`](crates/snap7-client) | Async PLC client (`S7Client`, `S7PlusClient`, connection pool, TLS, UDP) — includes protocol layer |
-| [`snap7-server`](crates/snap7-server) | In-process PLC simulator for testing with data store, callbacks, CPU state |
+| [`snap7-server`](crates/snap7-server) | In-process PLC simulator with data store, area locking, event queue, CPU state, callbacks |
+| [`snap7-partner`](crates/snap7-partner) | S7 Partner peer — active/passive BSend/BRecv over S7 UserData PDU |
 | [`snap7-opcua-gateway`](crates/snap7-opcua-gateway) | OPC-UA bridge with subscription support |
 | [`snap7-cli`](snap7-cli) | CLI binary (`snap7`) + helper servers |
+
+---
+
+## Feature matrix vs C snap7
+
+### Client API (`Cli_*`)
+
+| C snap7 function | rs-snap7 equivalent | Status |
+|---|---|---|
+| `Cli_Create` / `Cli_Destroy` | `S7Client::connect` / drop | ✅ |
+| `Cli_Connect` / `Cli_ConnectTo` | `S7Client::connect(addr, params)` | ✅ |
+| `Cli_Disconnect` | drop `S7Client` | ✅ |
+| `Cli_GetConnected` | `is_connected()` | ✅ |
+| — (reconnect after drop) | `reconnect()` on `S7Client<TcpTransport>` | ✅ |
+| `Cli_SetConnectionParams` | `ConnectParams` struct | ✅ |
+| `Cli_SetConnectionType` | `ConnectParams.rack/slot` | ✅ |
+| `Cli_SetParam` / `Cli_GetParam` | `set_request_timeout` / `request_timeout`, `get_pdu_length` | ✅ |
+| `Cli_DBRead` | `db_read(db, start, size)` | ✅ |
+| `Cli_DBWrite` | `db_write(db, start, data)` | ✅ |
+| `Cli_ABRead` | `ab_read(area, db, start, size)` | ✅ |
+| `Cli_ABWrite` | `ab_write(area, db, start, data)` | ✅ |
+| `Cli_MBRead` | `mb_read(start, size)` | ✅ |
+| `Cli_MBWrite` | `mb_write(start, data)` | ✅ |
+| `Cli_EBRead` | `eb_read(start, size)` | ✅ |
+| `Cli_EBWrite` | `eb_write(start, data)` | ✅ |
+| `Cli_IBRead` (Process Output) | `ib_read(start, size)` | ✅ |
+| `Cli_IBWrite` (Process Output) | `ib_write(start, data)` | ✅ |
+| `Cli_TMRead` | `tm_read(start, count)` | ✅ |
+| `Cli_TMWrite` | `tm_write(start, data)` | ✅ |
+| `Cli_CTRead` | `ct_read(start, count)` | ✅ |
+| `Cli_CTWrite` | `ct_write(start, data)` | ✅ |
+| `Cli_ReadArea` | `read_area(area, db, start, count, transport)` | ✅ |
+| `Cli_WriteArea` | `write_area(area, db, start, transport, data)` | ✅ |
+| `Cli_ReadMultiVars` | `read_multi_vars(items)` | ✅ |
+| `Cli_WriteMultiVars` | `write_multi_vars(items)` | ✅ |
+| `Cli_DBGet` | `db_get(db)` | ✅ |
+| `Cli_DBFill` | `db_fill(db, fill_byte)` | ✅ |
+| `Cli_ListBlocks` | `list_blocks()` | ✅ |
+| `Cli_ListBlocksOfType` | `list_blocks_of_type(block_type)` | ✅ |
+| `Cli_GetAgBlockInfo` | `get_ag_block_info(block_type, block_num)` | ✅ |
+| `Cli_GetPgBlockInfo` | `S7Client::parse_block_info(data)` (offline, no PLC needed) | ✅ |
+| `Cli_Upload` | `upload(block_type, block_num)` | ✅ |
+| `Cli_FullUpload` | `full_upload(block_type, block_num)` | ✅ |
+| `Cli_Download` | `download(block_type, block_num, data)` | ✅ |
+| `Cli_Delete` | `delete_block(block_type, block_num)` | ✅ |
+| `Cli_PlcStop` | `plc_stop()` | ✅ |
+| `Cli_PlcHotStart` | `plc_hot_start()` | ✅ |
+| `Cli_PlcColdStart` | `plc_cold_start()` | ✅ |
+| `Cli_GetPlcStatus` | `get_plc_status()` | ✅ |
+| `Cli_GetPlcDateTime` | `read_clock()` | ✅ |
+| `Cli_SetPlcDateTime` | `set_clock(dt)` | ✅ |
+| `Cli_SetPlcSystemDateTime` | `set_clock_to_now()` | ✅ |
+| `Cli_GetOrderCode` | `get_order_code()` | ✅ |
+| `Cli_GetCpuInfo` | `get_cpu_info()` | ✅ |
+| `Cli_GetCpInfo` | `get_cp_info()` | ✅ |
+| `Cli_ReadSZL` | `read_szl(szl_id, szl_index)` | ✅ |
+| `Cli_ReadSZLList` | `read_szl_list()` | ✅ |
+| `Cli_SetSessionPassword` | `set_session_password(pw)` | ✅ |
+| `Cli_ClearSessionPassword` | `clear_session_password()` | ✅ |
+| `Cli_GetProtection` | `get_protection()` | ✅ |
+| `Cli_CopyRamToRom` | `copy_ram_to_rom()` | ✅ |
+| `Cli_Compress` | `compress()` | ✅ |
+| `Cli_GetPduLength` | `get_pdu_length()` | ✅ |
+| `Cli_GetExecTime` | `get_exec_time()` → ms since last send | ✅ |
+| `Cli_GetLastError` | Rust `Result<T, Error>` | ✅ |
+| `Cli_ErrorText` | `Error::to_string()` | ✅ |
+| `Cli_IsoExchangeBuffer` | — (raw PDU exchange) | ❌ |
+| `Cli_As*` (all async variants) | native `async fn` everywhere | ✅ |
+| `Cli_WaitAsCompletion` / `Cli_CheckAsCompletion` | `.await` | ✅ |
+| `Cli_SetAsCallback` | `.await` / tokio tasks | ✅ |
+
+### Server API (`Srv_*`)
+
+| C snap7 function | rs-snap7 equivalent | Status |
+|---|---|---|
+| `Srv_Create` / `Srv_Destroy` | `S7Server::bind(cfg)` / drop | ✅ |
+| `Srv_Start` / `Srv_StartTo` | `server.serve(store)` / `S7Server::start_to(addr, max_conn)` | ✅ |
+| `Srv_Stop` | drop / cancel the serve task | ✅ |
+| `Srv_RegisterArea` | `store.register_area(area_code, size)` | ✅ |
+| `Srv_UnregisterArea` | `store.unregister_area(area_code)` | ✅ |
+| `Srv_LockArea` | `store.lock_area(area_code)` / `S7Server::lock_area` | ✅ |
+| `Srv_UnlockArea` | `store.unlock_area(area_code)` / `S7Server::unlock_area` | ✅ |
+| `Srv_GetStatus` | `S7Server::get_status(store)` → `ServerStatus` | ✅ |
+| `Srv_SetCpuStatus` | `S7Server::set_cpu_status(store, state)` | ✅ |
+| `Srv_GetMask` | `S7Server::get_mask(store)` | ✅ |
+| `Srv_SetMask` | `S7Server::set_mask(store, mask)` | ✅ |
+| `Srv_ClearEvents` | `S7Server::clear_events(store)` | ✅ |
+| `Srv_PickEvent` | `S7Server::pick_event(store)` → `Option<EventInfo>` | ✅ |
+| `Srv_SetEventsCallback` | `store.on_event(cb)` | ✅ |
+| `Srv_SetReadEventsCallback` | `store.on_read(cb)` | ✅ |
+| `Srv_SetRWAreaCallback` | `store.on_write(cb)` | ✅ |
+| `Srv_GetParam` / `Srv_SetParam` | `ServerConfig` struct | ✅ |
+| `Srv_ErrorText` / `Srv_EventText` | `Error::to_string()` | ✅ |
+
+### Partner API (`Par_*`)
+
+| C snap7 function | rs-snap7 equivalent | Status |
+|---|---|---|
+| `Par_Create` / `Par_Destroy` | `S7Partner::connect` / `S7Partner::listen` / drop | ✅ |
+| `Par_Start` / `Par_StartTo` | `S7Partner::connect(addr)` / `S7Partner::listen(addr)` | ✅ |
+| `Par_Stop` | drop | ✅ |
+| `Par_BSend` | `partner.bsend(r_id, data)` | ✅ |
+| `Par_AsBSend` | native `async fn bsend` | ✅ |
+| `Par_WaitAsBSendCompletion` | `.await` | ✅ |
+| `Par_CheckAsBSendCompletion` | `.await` + `tokio::select!` | ✅ |
+| `Par_SetSendCallback` | tokio tasks / channels | ✅ |
+| `Par_BRecv` | `partner.brecv()` | ✅ |
+| `Par_CheckAsBRecvCompletion` | `.await` + `tokio::select!` | ✅ |
+| `Par_SetRecvCallback` | tokio tasks / channels | ✅ |
+| `Par_GetStatus` | `partner.get_status()` → `PartnerStatus` | ✅ |
+| `Par_GetTimes` | — (no per-direction timing) | ❌ |
+| `Par_GetStats` | `partner.get_stats()` → `(bytes_sent, bytes_recv)` | ✅ |
+| `Par_GetParam` / `Par_SetParam` | `recv_timeout` / `send_timeout` fields | ✅ |
+| `Par_GetLastError` | Rust `Result<T, Error>` | ✅ |
+| `Par_ErrorText` | `Error::to_string()` | ✅ |
+
+### rs-snap7 extras (no C equivalent)
+
+| Feature | Crate |
+|---|---|
+| S7CommPlus (S7-1200/1500 integrity mode) | `snap7-client` |
+| TLS transport (S7CommPlus encrypted) | `snap7-client` |
+| UDP transport | `snap7-client` |
+| Connection pool with max-size semaphore | `snap7-client` |
+| OPC-UA gateway with subscriptions | `snap7-opcua-gateway` |
+| Typed tag parser (DB/M/T/C address syntax) | `snap7-cli` |
+| CLI with JSON/CSV/text output | `snap7-cli` |
+| Fully async — no blocking thread per connection | all crates |
 
 ---
 
@@ -129,6 +262,12 @@ snap7 -H 192.168.1.100 password clear
 snap7 -H 192.168.1.100 diag
 ```
 
+Every command prints the round-trip execution time to stderr on completion:
+
+```
+exec time: 4 ms
+```
+
 ### TLS and UDP transport
 
 ```bash
@@ -207,7 +346,9 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-snap7-client = { git = "https://github.com/cool0looc/rs-snap7" }
+snap7-client  = { git = "https://github.com/cool0looc/rs-snap7" }
+snap7-server  = { git = "https://github.com/cool0looc/rs-snap7" }  # optional
+snap7-partner = { git = "https://github.com/cool0looc/rs-snap7" }  # optional
 ```
 
 ### Async client (S7Comm — S7-300/400)
@@ -230,39 +371,37 @@ async fn main() -> anyhow::Result<()> {
 
     let client = S7Client::<TcpTransport>::connect(addr, params).await?;
 
-    // Read 4 bytes from DB1 offset 0
+    // Read / write DB
     let data = client.db_read(1, 0, 4).await?;
-    println!("{data:?}");
-
-    // Write
     client.db_write(1, 0, &[0xDE, 0xAD, 0xBE, 0xEF]).await?;
 
-    // Multi-read (one PDU, automatic batching)
-    use snap7_client::MultiReadItem;
-    let items = vec![
-        MultiReadItem::db(1, 0, 4),
-        MultiReadItem::db(2, 0, 2),
-    ];
-    let results = client.read_multi_vars(&items).await?;
+    // Merker / process I/O
+    let _mk = client.mb_read(10, 4).await?;
+    client.mb_write(10, &[0xFF]).await?;
+    let _pi = client.eb_read(0, 2).await?;
+    let _po = client.ib_read(0, 2).await?;
 
-    // Multi-write (one PDU, automatic batching)
-    use snap7_client::MultiWriteItem;
-    let items = vec![
-        MultiWriteItem::db(1, 0, vec![0xAA, 0xBB]),
-        MultiWriteItem::db(2, 10, vec![0x01, 0x02]),
-    ];
+    // Timers and counters
+    let _timers   = client.tm_read(0, 5).await?;
+    let _counters = client.ct_read(0, 3).await?;
+
+    // Multi-read / multi-write (one PDU, automatic batching)
+    use snap7_client::{MultiReadItem, MultiWriteItem};
+    let items = vec![MultiReadItem::db(1, 0, 4), MultiReadItem::db(2, 0, 2)];
+    let _results = client.read_multi_vars(&items).await?;
+
+    let items = vec![MultiWriteItem::db(1, 0, vec![0xAA, 0xBB])];
     client.write_multi_vars(&items).await?;
 
     // Read/write any area with explicit transport size
     use snap7_client::proto::s7::header::{Area, TransportSize};
-    let data = client.read_area(Area::Marker, 0, 10, 1, TransportSize::Byte).await?;
-    let data = client.read_area(Area::Timer, 0, 5, 1, TransportSize::Timer).await?;
-    let data = client.read_area(Area::Counter, 0, 3, 1, TransportSize::Counter).await?;
+    let _data = client.read_area(Area::Marker, 0, 10, 1, TransportSize::Byte).await?;
+    let _data = client.read_area(Area::Timer, 0, 5, 1, TransportSize::Timer).await?;
     client.write_area(Area::Marker, 0, 10, TransportSize::Byte, &[0xFF]).await?;
 
-    // Absolute area read/write (byte transport, any area)
-    let data = client.ab_read(Area::Marker, 0, 0, 4).await?;
-    client.ab_write(Area::ProcessOutput, 0, 0, &[0x00]).await?;
+    // PDU length
+    let pdu = client.get_pdu_length().await;
+    println!("Negotiated PDU: {pdu} bytes");
 
     Ok(())
 }
@@ -280,20 +419,15 @@ async fn main() -> anyhow::Result<()> {
     let client = S7PlusClient::connect(addr, Default::default()).await?;
 
     let data = client.db_read(1, 0, 4).await?;
-    println!("{data:?}");
-
     client.db_write(1, 0, &[0xDE, 0xAD, 0xBE, 0xEF]).await?;
 
     // Multi-read
     use snap7_client::plus_client::DbVarSpec;
-    let specs = vec![
-        DbVarSpec { db: 1, offset: 0, length: 4 },
-        DbVarSpec { db: 2, offset: 0, length: 2 },
-    ];
-    let results = client.read_multi_vars(&specs).await?;
+    let specs = vec![DbVarSpec { db: 1, offset: 0, length: 4 }];
+    let _results = client.read_multi_vars(&specs).await?;
 
-    // TLS connection (S7CommPlus over TLS)
-    let client = S7PlusClient::connect_tls(
+    // TLS connection
+    let _client = S7PlusClient::connect_tls(
         addr, "plc.example.com", None, Default::default()
     ).await?;
 
@@ -304,130 +438,56 @@ async fn main() -> anyhow::Result<()> {
 ### PLC control & information
 
 ```rust
-// Read PLC status via SZL 0x0424 (works on S7-300/400/1200/1500)
-let status = client.get_plc_status().await?;
-println!("{status:?}"); // Run | Stop | Unknown
-
-// Control the PLC
+// Status
+let status = client.get_plc_status().await?;  // Run | Stop | Unknown
 client.plc_stop().await?;
 client.plc_hot_start().await?;
 client.plc_cold_start().await?;
 
-// Read order code (e.g. "6ES7 317-2EK14-0AB0")
-let oc = client.get_order_code().await?;
-println!("Order code: {}", oc.code);
-
-// Read detailed CPU info
+// Identity
+let oc = client.get_order_code().await?;    // e.g. "6ES7 317-2EK14-0AB0"
 let ci = client.get_cpu_info().await?;
-println!("Module: {}", ci.module_type);
-println!("Serial: {}", ci.serial_number);
-println!("AS name: {}", ci.as_name);
-
-// Read CP info (max PDU size, connections, baud rates)
 let cp = client.get_cp_info().await?;
 
-// Read module list
-let modules = client.read_module_list().await?;
+// Clock
+let dt = client.read_clock().await?;
+client.set_clock(&dt).await?;
+client.set_clock_to_now().await?;           // sync PLC clock to host UTC
+
+// SZL
+let szl  = client.read_szl(0x001C, 0).await?;
+let ids  = client.read_szl_list().await?;   // all available SZL IDs
 ```
 
 ### Block operations
 
 ```rust
-// List all blocks grouped by type
-let list = client.list_blocks().await?;
-for entry in &list.entries {
-    println!("Type 0x{:04X}: {} blocks", entry.block_type, entry.count);
-}
+let list    = client.list_blocks().await?;
+let numbers = client.list_blocks_of_type(0x41).await?;    // all DBs
+let info    = client.get_ag_block_info(0x41, 1).await?;   // DB 1
+let raw     = client.db_get(1).await?;
 
-// List all block numbers of a given type
-let numbers = client.list_blocks_of_type(0x41).await?; // all DBs
-for n in &numbers { println!("DB{n}"); }
-
-// Get detailed block info
-let info = client.get_ag_block_info(0x41, 1).await?; // DB 1
-println!("Size: {} bytes, Author: {}", info.size, info.author);
-
-// Upload a block (Diagra format)
-let data = client.upload(0x41, 1).await?;
-if let Some(bd) = snap7_client::BlockData::from_bytes(&data) {
-    println!("Uploaded block {} bytes", bd.total_length);
-}
-
-// Download a block
+let data    = client.upload(0x41, 1).await?;               // header only
+let mc7     = client.full_upload(0x41, 1).await?;          // with MC7 code
 client.download(0x41, 1, &data).await?;
-
-// Delete a block
 client.delete_block(0x41, 1).await?;
-
-// Fill a DB with constant value
 client.db_fill(1, 0x00).await?;
-```
-
-### Typed tag parsing
-
-```rust
-use snap7_client::tag::parse_tag;
-
-// DB tags
-let tag = parse_tag("DB1,REAL4")?;     // REAL at byte 4
-let tag = parse_tag("DB1.REAL4")?;     // dot separator, same result
-let tag = parse_tag("DB70,332.0")?;    // bit 0 of byte 332
-
-// Merker tags (single-part, no separator)
-let tag = parse_tag("MB10")?;          // Merker byte at offset 10
-let tag = parse_tag("MW20")?;          // Merker word at offset 20
-let tag = parse_tag("MD4")?;           // Merker dword at offset 4
-let tag = parse_tag("M10.3")?;         // Merker bit: byte 10, bit 3
-let tag = parse_tag("MX5.7")?;         // Merker bit: byte 5, bit 7
-
-// Timer and Counter (element-index addressing)
-let tag = parse_tag("T5")?;            // Timer 5
-let tag = parse_tag("C3")?;            // Counter 3
 ```
 
 ### Session password & protection
 
 ```rust
-// Set session password
 client.set_session_password("mypass").await?;
-
-// Clear session password
 client.clear_session_password().await?;
-
-// Read protection level
-let protection = client.get_protection().await?;
-println!("Password set: {}", protection.password_set);
-println!("Level: {}", protection.level);
-```
-
-### Other client operations
-
-```rust
-// Read PLC clock
-let dt = client.read_clock().await?;
-
-// Copy RAM to ROM (retain on power-off)
-client.copy_ram_to_rom().await?;
-
-// Compress PLC work memory (must be in STOP)
-client.compress().await?;
-
-// Runtime parameter adjustment
-let timeout = client.request_timeout();
-client.set_request_timeout(std::time::Duration::from_secs(3)).await;
+let prot = client.get_protection().await?;
 ```
 
 ### Connection pool
 
 ```rust
 use snap7_client::{S7Pool, PoolConfig, ConnectParams};
-use std::net::SocketAddr;
 
-let addr: SocketAddr = "192.168.1.100:102".parse()?;
-let params = ConnectParams::default();
-let config = PoolConfig { max_size: 4, ..Default::default() };
-
-let pool = S7Pool::new(addr, params, config);
+let pool   = S7Pool::new(addr, ConnectParams::default(), PoolConfig { max_size: 4, ..Default::default() });
 let client = pool.get().await?;
 client.db_read(1, 0, 4).await?;
 ```
@@ -436,44 +496,66 @@ client.db_read(1, 0, 4).await?;
 
 ```rust
 use snap7_server::{S7Server, ServerConfig, DataStore, CpuState};
-use std::net::SocketAddr;
+use snap7_server::store::area;
 
 let store = DataStore::new();
 store.write_bytes(1, 0, &[1, 2, 3, 4]);
-
-// Area registration (required for non-DB reads)
-store.register_area(0x81, 1024);   // process inputs
-store.register_area(0x82, 1024);   // process outputs
-
-// CPU state tracking
+store.register_area(area::PROCESS_INPUTS, 1024);
 store.set_cpu_state(CpuState::Run);
 
-// Event callbacks
-store.on_read(|info| {
-    println!("Read  area=0x{:02X} db={}", info.area, info.db_number);
-});
-store.on_write(|info| {
-    println!("Write area=0x{:02X} db={}", info.area, info.db_number);
-});
+// Area locking — writes silently ignored while locked
+store.lock_area(area::DATA_BLOCK);
+store.unlock_area(area::DATA_BLOCK);
 
-let cfg = ServerConfig {
+// Event queue
+store.set_mask(0xFFFF_FFFF);
+if let Some(ev) = store.pick_event() {
+    println!("{}: area=0x{:02X}", ev.event, ev.area);
+}
+
+// Status
+let status = S7Server::get_status(&store);
+println!("clients={} cpu={:?}", status.clients_count, status.cpu_state);
+
+// Callbacks
+store.on_read(|info|  println!("read  area=0x{:02X} db={}", info.area, info.db_number));
+store.on_write(|info| println!("write area=0x{:02X} db={}", info.area, info.db_number));
+store.on_event(|ev|   println!("event: {ev}"));
+
+let server = S7Server::bind(ServerConfig {
     bind_addr: "127.0.0.1:0".parse()?,
     max_connections: 8,
-};
-let server = S7Server::bind(cfg).await?;
-let addr = server.local_addr()?;
-
+}).await?;
 tokio::spawn(server.serve(store));
-// addr is now ready to accept S7 connections
+```
+
+### S7 Partner (BSend/BRecv)
+
+```rust
+use snap7_partner::S7Partner;
+use std::net::SocketAddr;
+
+// Active partner — connects to remote
+let active = S7Partner::connect("192.168.1.100:102".parse()?).await?;
+active.bsend(0x0000_0001, b"hello").await?;
+
+// Passive partner — listens for remote to connect
+let passive = S7Partner::listen("0.0.0.0:102".parse()?).await?;
+let (r_id, data) = passive.brecv().await?;
+println!("R_ID={r_id:#010x} data={data:?}");
+
+// Bind separately to retrieve the port first
+let (listener, partner) = S7Partner::bind("127.0.0.1:0".parse()?).await?;
+let _port = listener.local_addr()?.port();
+S7Partner::accept(&partner, &listener).await?;
+let (r_id, data) = partner.brecv().await?;
 ```
 
 ### UDP transport
 
 ```rust
 use snap7_client::{S7Client, ConnectParams, UdpTransport};
-use std::net::SocketAddr;
 
-let addr: SocketAddr = "192.168.1.100:102".parse()?;
 let client = S7Client::<UdpTransport>::connect_udp(addr, ConnectParams::default()).await?;
 let data = client.db_read(1, 0, 4).await?;
 ```

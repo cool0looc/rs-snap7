@@ -149,8 +149,11 @@ async fn handle_user_data<T: AsyncWrite + Unpin>(
     pdu_ref: u16,
     payload: &[u8],
 ) -> Result<()> {
-    let szl_id = if payload.len() >= 10 {
-        u16::from_be_bytes([payload[8], payload[9]])
+    // payload = param(8) + data_envelope(4) + [szl_id:2][szl_index:2]
+    // param: [0x00,0x01,0x12,0x04,0x11,0x44,0x01,0x00]
+    // data:  [0xFF,0x09,0x00,0x04, szl_id_hi, szl_id_lo, idx_hi, idx_lo]
+    let szl_id = if payload.len() >= 14 {
+        u16::from_be_bytes([payload[12], payload[13]])
     } else {
         0
     };
@@ -182,55 +185,78 @@ async fn handle_user_data<T: AsyncWrite + Unpin>(
     send_cotp_data(transport, buf.freeze()).await
 }
 
+fn szl_block(szl_id: u16, szl_index: u16, entry_len: u16, entries: &[u8]) -> Vec<u8> {
+    let entry_count = if entry_len > 0 { (entries.len() / entry_len as usize) as u16 } else { 0 };
+    let mut v = Vec::with_capacity(8 + entries.len());
+    v.extend_from_slice(&szl_id.to_be_bytes());
+    v.extend_from_slice(&szl_index.to_be_bytes());
+    v.extend_from_slice(&entry_len.to_be_bytes());
+    v.extend_from_slice(&entry_count.to_be_bytes());
+    v.extend_from_slice(entries);
+    v
+}
+
 fn build_szl_response(szl_id: u16) -> Vec<u8> {
     match szl_id {
+        // Order code: entry_len=28 (2-byte index + 20-byte string + 6 version bytes)
         0x0011 => {
-            let d = vec![b' '; 20];
-            let blk = (4 + d.len()) as u16;
-            let mut v = Vec::with_capacity(6 + d.len());
-            v.extend_from_slice(&blk.to_be_bytes());
-            v.extend_from_slice(&szl_id.to_be_bytes());
-            v.extend_from_slice(&[0x00, 0x00]);
-            v.extend_from_slice(&d);
-            v
+            let mut entry = vec![0u8; 28];
+            entry[0] = 0x00; entry[1] = 0x01; // entry index 0x0001
+            let s = b"Simulated PLC       "; // 20 chars
+            entry[2..2 + s.len()].copy_from_slice(s);
+            // version: v1.v2.v3 at offsets 23,24,25 (after 2-idx + 20-str + 1-pad)
+            entry[23] = 1; entry[24] = 0; entry[25] = 0;
+            szl_block(0x0011, 0x0000, 28, &entry)
         }
+        // Protection level
         0x0032 => {
-            let pl: Vec<u8> = {
-                let mut v = Vec::with_capacity(16);
-                v.extend_from_slice(&[0x00; 8]); // scheme_szl + scheme_module + scheme_bus + level
-                v.extend_from_slice(b"        "); // pass_word
-                v
-            };
-            let blk = (4 + pl.len()) as u16;
-            let mut v = Vec::with_capacity(6 + pl.len());
-            v.extend_from_slice(&blk.to_be_bytes());
-            v.extend_from_slice(&szl_id.to_be_bytes());
-            v.extend_from_slice(&[0x00, 0x04]);
-            v.extend_from_slice(&pl);
-            v
+            let mut entry = vec![0u8; 16];
+            // scheme_szl=3, scheme_module=3, scheme_bus=3, level=0
+            entry[0] = 3; entry[2] = 3; entry[4] = 3;
+            szl_block(0x0032, 0x0000, 16, &entry)
         }
+        // CPU info: entry_len=34 (2-byte index + 32-byte string), 7 entries
         0x001C => {
-            let mut pl = vec![b' '; 122];
-            let name = b"Simulated PLC";
-            pl[..name.len().min(24)].copy_from_slice(&name[..name.len().min(24)]);
-            let blk = (4 + pl.len()) as u16;
-            let mut v = Vec::with_capacity(6 + pl.len());
-            v.extend_from_slice(&blk.to_be_bytes());
-            v.extend_from_slice(&szl_id.to_be_bytes());
-            v.extend_from_slice(&[0x00, 0x00]);
-            v.extend_from_slice(&pl);
-            v
+            const SLEN: usize = 32;
+            const ELEN: usize = 2 + SLEN;
+            let entry_len = ELEN as u16;
+
+            let make = |idx: u16, s: &[u8]| -> [u8; ELEN] {
+                let mut e = [b' '; ELEN];
+                e[0] = (idx >> 8) as u8;
+                e[1] = idx as u8;
+                let n = s.len().min(SLEN);
+                e[2..2 + n].copy_from_slice(&s[..n]);
+                e
+            };
+
+            let mut entries = Vec::with_capacity(7 * ELEN);
+            entries.extend_from_slice(&make(0x0001, b"SimPLC"));           // AS name
+            entries.extend_from_slice(&make(0x0002, b"CPU Simulated"));    // module type (S7-300 style)
+            entries.extend_from_slice(&make(0x0003, b"SimPLC"));           // module name
+            entries.extend_from_slice(&make(0x0004, b"(C) Simulated"));    // copyright
+            entries.extend_from_slice(&make(0x0005, b"SIM-0000000001"));   // serial number
+            entries.extend_from_slice(&make(0x0007, b"CPU Simulated"));    // canonical module type
+            entries.extend_from_slice(&make(0x0008, b"SimPLC"));           // module name (dup)
+            szl_block(0x001C, 0x0000, entry_len, &entries)
         }
-        _ => {
-            let pl: Vec<u8> = Vec::new();
-            let blk = (4 + pl.len()) as u16;
-            let mut v = Vec::with_capacity(6 + pl.len());
-            v.extend_from_slice(&blk.to_be_bytes());
-            v.extend_from_slice(&szl_id.to_be_bytes());
-            v.extend_from_slice(&[0x00, 0x00]);
-            v.extend_from_slice(&pl);
-            v
+        // CP info: index(2) + max_pdu(2) + max_conn(2) + max_mpi(4) + max_bus(4) = 14 bytes
+        0x0131 => {
+            let mut entry = vec![0u8; 14];
+            entry[0] = 0x00; entry[1] = 0x01; // index 0x0001
+            entry[2] = 0x01; entry[3] = 0xE0; // max_pdu=480
+            entry[4] = 0x00; entry[5] = 0x20; // max_connections=32
+            entry[6] = 0x00; entry[7] = 0x02; entry[8] = 0xDC; entry[9] = 0x6C; // max_mpi=187500
+            entry[10] = 0x00; entry[11] = 0x00; entry[12] = 0x61; entry[13] = 0xA8; // max_bus=25000
+            szl_block(0x0131, 0x0001, 14, &entry)
         }
+        // PLC status: entries[3]=0x08 → payload[11]=0x08 (RUN), matching get_plc_status logic
+        0x0424 => {
+            let mut data = vec![0u8; 12];
+            data[3] = 0x08; // RUN — payload[8+3]=payload[11]
+            szl_block(0x0424, 0x0000, 12, &data)
+        }
+        _ => szl_block(szl_id, 0x0000, 0, &[]),
     }
 }
 

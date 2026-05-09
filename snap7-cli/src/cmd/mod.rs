@@ -67,5 +67,7 @@ pub async fn run() -> Result<()> {
         Command::Serve(_) => unreachable!(), // Handled above
     }
 
+    eprintln!("exec time: {} ms", client.get_exec_time().await);
+
     Ok(())
 }

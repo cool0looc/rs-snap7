@@ -1,6 +1,6 @@
 [package]
 name = "snap7-bench"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 publish = false
 license = "MIT"
@@ -20,8 +20,8 @@ name = "s7_ops_sync"
 harness = false
 
 [dependencies]
-snap7-client = { version = "0.1.5", path = "../crates/snap7-client" }
-snap7-server = { version = "0.1.5", path = "../crates/snap7-server" }
+snap7-client = { version = "0.1.7", path = "../crates/snap7-client" }
+snap7-server = { version = "0.1.7", path = "../crates/snap7-server" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time", "sync"] }
 
 [dev-dependencies]

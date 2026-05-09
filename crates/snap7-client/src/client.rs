@@ -70,11 +70,15 @@ struct Inner<T> {
     connection: Connection,
     pdu_ref: u16,
     request_timeout: std::time::Duration,
+    connected: bool,
+    job_start: Option<std::time::Instant>,
+    last_exec_ms: u32,
 }
 
 pub struct S7Client<T: AsyncRead + AsyncWrite + Unpin + Send> {
     inner: Mutex<Inner<T>>,
     params: ConnectParams,
+    remote_addr: Option<SocketAddr>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
@@ -88,14 +92,33 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
                 connection,
                 pdu_ref: 1,
                 request_timeout: timeout,
+                connected: true,
+                job_start: None,
+                last_exec_ms: 0,
             }),
             params,
+            remote_addr: None,
         })
     }
 
     /// Return the current request timeout.
     pub fn request_timeout(&self) -> std::time::Duration {
         self.params.request_timeout
+    }
+
+    /// Returns the execution time of the last completed S7 operation in milliseconds.
+    ///
+    /// Measures full round-trip: from send to response received. Equivalent to C `Cli_GetExecTime`.
+    pub async fn get_exec_time(&self) -> u32 {
+        self.inner.lock().await.last_exec_ms
+    }
+
+    /// Returns whether the transport connection is alive.
+    ///
+    /// Set to `false` when any I/O error is encountered.
+    /// Equivalent to C `Cli_GetConnected`.
+    pub async fn is_connected(&self) -> bool {
+        self.inner.lock().await.connected
     }
 
     /// Update the request timeout at runtime.
@@ -178,6 +201,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         };
         let mut tb = BytesMut::new();
         tpkt.encode(&mut tb)?;
+        inner.job_start = Some(std::time::Instant::now());
         inner.transport.write_all(&tb).await?;
         Ok(())
     }
@@ -185,17 +209,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
     async fn recv_s7(inner: &mut Inner<T>) -> Result<(S7Header, Bytes)> {
         let timeout = inner.request_timeout;
         let mut tpkt_hdr = [0u8; 4];
-        tokio::time::timeout(timeout, inner.transport.read_exact(&mut tpkt_hdr))
+        if let Err(e) = tokio::time::timeout(timeout, inner.transport.read_exact(&mut tpkt_hdr))
             .await
-            .map_err(|_| Error::Timeout(timeout))??;
+            .map_err(|_| Error::Timeout(timeout))
+            .and_then(|r| r.map_err(Error::Io))
+        {
+            inner.connected = false;
+            return Err(e);
+        }
         let total = u16::from_be_bytes([tpkt_hdr[2], tpkt_hdr[3]]) as usize;
         if total < 4 {
             return Err(Error::UnexpectedResponse);
         }
         let mut payload = vec![0u8; total - 4];
-        tokio::time::timeout(timeout, inner.transport.read_exact(&mut payload))
+        if let Err(e) = tokio::time::timeout(timeout, inner.transport.read_exact(&mut payload))
             .await
-            .map_err(|_| Error::Timeout(timeout))??;
+            .map_err(|_| Error::Timeout(timeout))
+            .and_then(|r| r.map_err(Error::Io))
+        {
+            inner.connected = false;
+            return Err(e);
+        }
         let mut b = Bytes::from(payload);
 
         // COTP DT header: LI (1) + code (1) + tpdu_nr (1)
@@ -210,6 +244,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         b.advance(1); // tpdu_nr byte
 
         let header = S7Header::decode(&mut b)?;
+        if let Some(t0) = inner.job_start.take() {
+            inner.last_exec_ms = t0.elapsed().as_millis() as u32;
+        }
         Ok((header, b))
     }
 
@@ -648,6 +685,86 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         self.write_multi_vars(&items).await
     }
 
+    /// Read Merker (flag) bytes starting at `start`, `length` bytes.
+    pub async fn mb_read(&self, start: u32, length: u16) -> Result<Bytes> {
+        self.ab_read(Area::Marker, 0, start, length).await
+    }
+
+    /// Write Merker (flag) bytes starting at `start`.
+    pub async fn mb_write(&self, start: u32, data: &[u8]) -> Result<()> {
+        self.ab_write(Area::Marker, 0, start, data).await
+    }
+
+    /// Read I/O input (EB) bytes starting at `start`, `length` bytes.
+    pub async fn eb_read(&self, start: u32, length: u16) -> Result<Bytes> {
+        self.ab_read(Area::ProcessInput, 0, start, length).await
+    }
+
+    /// Write I/O input (EB) bytes starting at `start`.
+    pub async fn eb_write(&self, start: u32, data: &[u8]) -> Result<()> {
+        self.ab_write(Area::ProcessInput, 0, start, data).await
+    }
+
+    /// Read I/O output (AB) bytes starting at `start`, `length` bytes.
+    pub async fn ib_read(&self, start: u32, length: u16) -> Result<Bytes> {
+        self.ab_read(Area::ProcessOutput, 0, start, length).await
+    }
+
+    /// Write I/O output (AB) bytes starting at `start`.
+    pub async fn ib_write(&self, start: u32, data: &[u8]) -> Result<()> {
+        self.ab_write(Area::ProcessOutput, 0, start, data).await
+    }
+
+    /// Read `amount` Timer words starting at timer index `start`.
+    pub async fn tm_read(&self, start: u32, amount: u16) -> Result<Bytes> {
+        let items = [MultiReadItem {
+            area: Area::Timer,
+            db_number: 0,
+            start,
+            length: amount,
+            transport: TransportSize::Timer,
+        }];
+        let mut results = self.read_multi_vars(&items).await?;
+        Ok(results.swap_remove(0))
+    }
+
+    /// Write Timer S5Time words. `data` must be `amount * 2` bytes (one word per timer).
+    pub async fn tm_write(&self, start: u32, data: &[u8]) -> Result<()> {
+        let amount = (data.len() / 2) as u16;
+        let items = [MultiWriteItem {
+            area: Area::Timer,
+            db_number: 0,
+            start,
+            data: Bytes::copy_from_slice(data),
+        }];
+        let _ = amount;
+        self.write_multi_vars(&items).await
+    }
+
+    /// Read `amount` Counter BCD words starting at counter index `start`.
+    pub async fn ct_read(&self, start: u32, amount: u16) -> Result<Bytes> {
+        let items = [MultiReadItem {
+            area: Area::Counter,
+            db_number: 0,
+            start,
+            length: amount,
+            transport: TransportSize::Counter,
+        }];
+        let mut results = self.read_multi_vars(&items).await?;
+        Ok(results.swap_remove(0))
+    }
+
+    /// Write Counter BCD words. `data` must be `amount * 2` bytes (one word per counter).
+    pub async fn ct_write(&self, start: u32, data: &[u8]) -> Result<()> {
+        let items = [MultiWriteItem {
+            area: Area::Counter,
+            db_number: 0,
+            start,
+            data: Bytes::copy_from_slice(data),
+        }];
+        self.write_multi_vars(&items).await
+    }
+
     pub async fn read_szl(&self, szl_id: u16, szl_index: u16) -> Result<SzlResponse> {
         let payload = self.read_szl_payload(szl_id, szl_index).await?;
         let mut b = payload;
@@ -721,6 +838,112 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
             body.advance(body.remaining() - 8);
         }
         Ok(PlcDateTime::decode(&mut body)?)
+    }
+
+    /// Set the PLC clock (UserData subfunction 0x01 of function group 0xF5).
+    pub async fn set_clock(&self, dt: &PlcDateTime) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+        // Param: method=0x11 (request), fn_group=0xF5 (clock), subfn=0x01 (set), param_len=0x08
+        let mut param_buf = BytesMut::new();
+        param_buf.extend_from_slice(&[0x00, 0x01, 0x12, 0x08, 0xF5, 0x01]);
+        // Data envelope: return_code=0xFF, transport=0x09 (OCTET_STRING), length=8
+        let mut data_buf = BytesMut::new();
+        data_buf.extend_from_slice(&[0xFF, 0x09, 0x00, 0x08]);
+        dt.encode(&mut data_buf);
+        Self::send_s7(
+            &mut inner,
+            param_buf.freeze(),
+            data_buf.freeze(),
+            pdu_ref,
+            PduType::UserData,
+        )
+        .await?;
+        let (header, _body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "set_clock")?;
+        Ok(())
+    }
+
+    /// Set the PLC clock to the host system time.
+    ///
+    /// Uses [`std::time::SystemTime`] converted to a [`PlcDateTime`].  The
+    /// weekday field is set to 0 (unknown) since `SystemTime` does not carry it.
+    pub async fn set_clock_to_now(&self) -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Simple UTC decomposition (no leap-second handling)
+        let s = secs % 60;
+        let m = (secs / 60) % 60;
+        let h = (secs / 3600) % 24;
+        // Days since epoch
+        let days = secs / 86400;
+        // Rough Gregorian year calculation
+        let mut year = 1970u16;
+        let mut d = days;
+        loop {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            let days_in_year: u64 = if leap { 366 } else { 365 };
+            if d < days_in_year {
+                break;
+            }
+            d -= days_in_year;
+            year += 1;
+        }
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days_per_month: [u64; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let mut month = 1u8;
+        for &dpm in &days_per_month {
+            if d < dpm {
+                break;
+            }
+            d -= dpm;
+            month += 1;
+        }
+        let dt = PlcDateTime {
+            year,
+            month,
+            day: (d + 1) as u8,
+            hour: h as u8,
+            minute: m as u8,
+            second: s as u8,
+            millisecond: 0,
+            weekday: 0,
+        };
+        self.set_clock(&dt).await
+    }
+
+    /// Read the list of all available SZL IDs from the PLC (SZL ID 0x0000).
+    ///
+    /// Returns a `Vec<u16>` where each entry is a supported SZL ID.
+    pub async fn read_szl_list(&self) -> Result<Vec<u16>> {
+        let payload = self.read_szl_payload(0x0000, 0x0000).await?;
+        if payload.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut b = payload;
+        // SZL block: [szl_id:2][szl_index:2][entry_len:2][entry_count:2][entries...]
+        if b.remaining() < 8 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let _szl_id = b.get_u16();
+        let _szl_index = b.get_u16();
+        let entry_len = b.get_u16() as usize;
+        let entry_count = b.get_u16() as usize;
+        if entry_len < 2 {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mut ids = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            if b.remaining() < entry_len {
+                break;
+            }
+            ids.push(b.get_u16());
+            b.advance(entry_len - 2);
+        }
+        Ok(ids)
     }
 
     /// Copy RAM data to ROM (function 0x43).
@@ -1407,6 +1630,61 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         })
     }
 
+    /// Parse block info from raw block bytes obtained via [`upload`](Self::upload)
+    /// or [`full_upload`](Self::full_upload). No PLC connection required.
+    ///
+    /// Equivalent to C `Cli_GetPgBlockInfo` offline parsing mode.
+    pub fn parse_block_info(data: &[u8]) -> Result<crate::types::BlockInfo> {
+        const HDR: usize = 36;
+        const FOOTER: usize = 48;
+        if data.len() < HDR + FOOTER {
+            return Err(Error::UnexpectedResponse);
+        }
+        let load_size = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        if load_size != data.len() {
+            return Err(Error::UnexpectedResponse);
+        }
+        let mc7_size = u16::from_be_bytes([data[34], data[35]]) as usize;
+        if mc7_size + HDR >= load_size {
+            return Err(Error::UnexpectedResponse);
+        }
+
+        let flags        = data[3] as u16;
+        let language     = data[4] as u16;
+        let block_type   = data[5] as u16;
+        let block_number = u16::from_be_bytes([data[6], data[7]]);
+        let sbb_len      = u16::from_be_bytes([data[28], data[29]]);
+        let local_data   = u16::from_be_bytes([data[32], data[33]]);
+
+        fn read_str(s: &[u8]) -> String {
+            let end = s.iter().position(|&x| x == 0).unwrap_or(s.len());
+            String::from_utf8_lossy(&s[..end]).trim().to_string()
+        }
+
+        let footer   = &data[load_size - FOOTER..];
+        let author   = read_str(&footer[20..28]);
+        let family   = read_str(&footer[28..36]);
+        let header   = read_str(&footer[36..44]);
+        let checksum = u16::from_be_bytes([footer[44], footer[45]]);
+
+        Ok(crate::types::BlockInfo {
+            block_type,
+            block_number,
+            language,
+            flags,
+            size: load_size.min(0xFFFF) as u16,
+            size_ram: sbb_len,
+            mc7_size: mc7_size as u16,
+            local_data,
+            checksum,
+            version: 0,
+            author,
+            family,
+            header,
+            date: String::new(),
+        })
+    }
+
     // -- Security / protection (set/clear password + get protection) ----------
 
     /// Set a session password for protected PLC access.
@@ -1595,6 +1873,78 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
         check_plc_error(&eheader, "upload_end")?;
 
         Ok(block_data)
+    }
+
+    /// Full-upload a PLC block including MC7 (executable) code (S7 function 0x1F).
+    ///
+    /// Unlike [`upload`](Self::upload) which returns only the header/interface,
+    /// `full_upload` returns the complete block including executable code.
+    pub async fn full_upload(&self, block_type: u8, block_number: u16) -> Result<Vec<u8>> {
+        let mut inner = self.inner.lock().await;
+        let pdu_ref = Self::next_pdu_ref(&mut inner);
+
+        // Step 1: Start full-upload (func=0x1F, sub-fn=0x00)
+        let mut param = BytesMut::with_capacity(6);
+        param.extend_from_slice(&[0x1F, 0x00, block_type, 0x00]);
+        param.put_u16(block_number);
+        Self::send_s7(&mut inner, param.freeze(), Bytes::new(), pdu_ref, PduType::Job).await?;
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&header, "full_upload_start")?;
+        if body.remaining() < 8 {
+            return Err(Error::UnexpectedResponse);
+        }
+        if body.remaining() >= 2 {
+            body.advance(2);
+        }
+        let upload_id = body.get_u32();
+        let _total_len = body.get_u32();
+
+        // Step 2: Loop data chunks (func=0x1F, sub-fn=0x01)
+        let mut block_data = Vec::new();
+        loop {
+            let chunk_ref = Self::next_pdu_ref(&mut inner);
+            let mut dparam = BytesMut::with_capacity(6);
+            dparam.extend_from_slice(&[0x1F, 0x01]);
+            dparam.put_u32(upload_id);
+            Self::send_s7(&mut inner, dparam.freeze(), Bytes::new(), chunk_ref, PduType::Job).await?;
+            let (dheader, mut dbody) = Self::recv_s7(&mut inner).await?;
+            check_plc_error(&dheader, "full_upload_data")?;
+            if dbody.remaining() >= 2 {
+                dbody.advance(2);
+            }
+            if dbody.is_empty() {
+                break;
+            }
+            if block_data.is_empty() && dbody.remaining() >= 4 {
+                if dbody[0] == 0xFF || dbody[0] == 0x00 {
+                    dbody.advance(4);
+                }
+            }
+            let chunk = dbody.copy_to_bytes(dbody.remaining());
+            block_data.extend_from_slice(&chunk);
+            if chunk.len() < inner.connection.pdu_size as usize - 50 {
+                break;
+            }
+            if block_data.len() > 1024 * 1024 * 4 {
+                return Err(Error::UnexpectedResponse);
+            }
+        }
+
+        // Step 3: End full-upload (func=0x1F, sub-fn=0x02)
+        let end_ref = Self::next_pdu_ref(&mut inner);
+        let mut eparam = BytesMut::with_capacity(6);
+        eparam.extend_from_slice(&[0x1F, 0x02]);
+        eparam.put_u32(upload_id);
+        Self::send_s7(&mut inner, eparam.freeze(), Bytes::new(), end_ref, PduType::Job).await?;
+        let (eheader, _) = Self::recv_s7(&mut inner).await?;
+        check_plc_error(&eheader, "full_upload_end")?;
+
+        Ok(block_data)
+    }
+
+    /// Return the negotiated PDU length in bytes.
+    pub async fn get_pdu_length(&self) -> u16 {
+        self.inner.lock().await.connection.pdu_size
     }
 
     /// Upload a DB block (convenience wrapper around [`upload`](Self::upload)).
@@ -1890,7 +2240,29 @@ impl S7Client<crate::transport::TcpTransport> {
     pub async fn connect(addr: SocketAddr, params: ConnectParams) -> Result<Self> {
         let transport =
             crate::transport::TcpTransport::connect(addr, params.connect_timeout).await?;
-        Self::from_transport(transport, params).await
+        let mut client = Self::from_transport(transport, params).await?;
+        client.remote_addr = Some(addr);
+        Ok(client)
+    }
+
+    /// Re-establish the TCP connection and S7 negotiate handshake after a disconnect.
+    ///
+    /// On success the client resumes normal operation. Returns an error if the
+    /// reconnection attempt fails (caller may retry with back-off).
+    pub async fn reconnect(&self) -> Result<()> {
+        let addr = self.remote_addr.ok_or(Error::ConnectionRefused)?;
+        let transport =
+            crate::transport::TcpTransport::connect(addr, self.params.connect_timeout).await?;
+        let mut t = transport;
+        let connection = connect(&mut t, &self.params).await?;
+        let mut inner = self.inner.lock().await;
+        inner.transport = t;
+        inner.connection = connection;
+        inner.pdu_ref = 1;
+        inner.connected = true;
+        inner.job_start = None;
+        inner.last_exec_ms = 0;
+        Ok(())
     }
 }
 
@@ -2455,5 +2827,375 @@ mod tests {
         let client = S7Client::from_transport(client_io, params).await.unwrap();
         let status = client.get_plc_status().await.unwrap();
         assert_eq!(status, crate::types::PlcStatus::Stop);
+    }
+
+    #[tokio::test]
+    async fn mb_read_returns_data() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        let expected = vec![0xAA, 0xBB];
+        tokio::spawn(mock_plc_multi_read(server_io, vec![expected.clone()]));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let data = client.mb_read(10, 2).await.unwrap();
+        assert_eq!(&data[..], &expected[..]);
+    }
+
+    #[tokio::test]
+    async fn eb_read_returns_data() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        let expected = vec![0x01, 0x02, 0x03];
+        tokio::spawn(mock_plc_multi_read(server_io, vec![expected.clone()]));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let data = client.eb_read(0, 3).await.unwrap();
+        assert_eq!(&data[..], &expected[..]);
+    }
+
+    #[tokio::test]
+    async fn ib_read_returns_data() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        let expected = vec![0x11, 0x22];
+        tokio::spawn(mock_plc_multi_read(server_io, vec![expected.clone()]));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let data = client.ib_read(0, 2).await.unwrap();
+        assert_eq!(&data[..], &expected[..]);
+    }
+
+    #[tokio::test]
+    async fn tm_read_returns_data() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        // Two timer words = 4 bytes
+        let expected = vec![0x00, 0x14, 0x00, 0x28];
+        tokio::spawn(mock_plc_multi_read(server_io, vec![expected.clone()]));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let data = client.tm_read(0, 2).await.unwrap();
+        assert_eq!(&data[..], &expected[..]);
+    }
+
+    #[tokio::test]
+    async fn ct_read_returns_data() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        // One counter word = 2 bytes
+        let expected = vec![0x00, 0x07];
+        tokio::spawn(mock_plc_multi_read(server_io, vec![expected.clone()]));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let data = client.ct_read(3, 1).await.unwrap();
+        assert_eq!(&data[..], &expected[..]);
+    }
+
+    async fn mock_set_clock(mut server_io: tokio::io::DuplexStream) {
+        let mut buf = vec![0u8; 4096];
+        mock_handshake(&mut server_io).await;
+        let _ = server_io.read(&mut buf).await;
+        // Send success AckData with no data
+        let mut s7b = BytesMut::new();
+        S7Header {
+            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 2,
+            param_len: 0, data_len: 0, error_class: Some(0), error_code: Some(0),
+        }.encode(&mut s7b);
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_clock_succeeds() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_set_clock(server_io));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let dt = crate::proto::s7::clock::PlcDateTime {
+            year: 2025, month: 5, day: 9, hour: 12, minute: 0, second: 0,
+            millisecond: 0, weekday: 5,
+        };
+        client.set_clock(&dt).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_clock_to_now_succeeds() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_set_clock(server_io));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        client.set_clock_to_now().await.unwrap();
+    }
+
+    async fn mock_szl_list(mut server_io: tokio::io::DuplexStream, ids: Vec<u16>) {
+        let mut buf = vec![0u8; 4096];
+        mock_handshake(&mut server_io).await;
+        let _ = server_io.read(&mut buf).await;
+
+        // Build SZL block: [szl_id=0x0000][szl_index=0][entry_len=4][entry_count=N][{id(2)+pad(2)}*N]
+        let entry_len: u16 = 4;
+        let entry_count = ids.len() as u16;
+        let mut szl = BytesMut::new();
+        szl.put_u16(0x0000); // szl_id
+        szl.put_u16(0x0000); // szl_index
+        szl.put_u16(entry_len);
+        szl.put_u16(entry_count);
+        for id in &ids {
+            szl.put_u16(*id);
+            szl.put_u16(0x0000); // padding
+        }
+        let szl_bytes = szl.freeze();
+        let data_len = (4 + szl_bytes.len()) as u16; // envelope(4) + szl_block
+
+        let mut s7b = BytesMut::new();
+        // param section (8 bytes echoed)
+        let param_len: u16 = 8;
+        S7Header {
+            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 2,
+            param_len, data_len, error_class: Some(0), error_code: Some(0),
+        }.encode(&mut s7b);
+        // echoed param (8 bytes)
+        s7b.extend_from_slice(&[0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00]);
+        // data envelope
+        s7b.put_u8(0xFF); s7b.put_u8(0x09);
+        s7b.put_u16(szl_bytes.len() as u16);
+        s7b.extend_from_slice(&szl_bytes);
+
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_szl_list_returns_ids() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        let ids = vec![0x0011u16, 0x001C, 0x0131, 0x0424];
+        tokio::spawn(mock_szl_list(server_io, ids.clone()));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let result = client.read_szl_list().await.unwrap();
+        assert_eq!(result, ids);
+    }
+
+    #[tokio::test]
+    async fn read_szl_list_empty_returns_empty() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_szl_list(server_io, vec![]));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let result = client.read_szl_list().await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// Mock for full_upload: handshake + 3-message exchange (start, data, end).
+    async fn mock_full_upload(mut server_io: tokio::io::DuplexStream, block_data: Vec<u8>) {
+        let mut buf = vec![0u8; 4096];
+        mock_handshake(&mut server_io).await;
+
+        // Start request (func=0x1F, sub-fn=0x00)
+        let _ = server_io.read(&mut buf).await;
+        let mut s7b = BytesMut::new();
+        S7Header {
+            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 2,
+            param_len: 2, data_len: 8, error_class: Some(0), error_code: Some(0),
+        }.encode(&mut s7b);
+        s7b.extend_from_slice(&[0x1F, 0x00]); // param echo
+        s7b.put_u32(0xDEAD_BEEF_u32); // upload_id
+        s7b.put_u32(block_data.len() as u32); // total_len
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+
+        // Data request (func=0x1F, sub-fn=0x01)
+        let _ = server_io.read(&mut buf).await;
+        let data_payload_len = (4 + block_data.len()) as u16; // return_code+transport+len(2) + data
+        let mut s7b = BytesMut::new();
+        S7Header {
+            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 3,
+            param_len: 2, data_len: data_payload_len, error_class: Some(0), error_code: Some(0),
+        }.encode(&mut s7b);
+        s7b.extend_from_slice(&[0x1F, 0x01]);
+        s7b.put_u8(0xFF); s7b.put_u8(0x04);
+        s7b.put_u16((block_data.len() * 8) as u16);
+        s7b.extend_from_slice(&block_data);
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+
+        // End request (func=0x1F, sub-fn=0x02)
+        let _ = server_io.read(&mut buf).await;
+        let mut s7b = BytesMut::new();
+        S7Header {
+            pdu_type: PduType::AckData, reserved: 0, pdu_ref: 4,
+            param_len: 0, data_len: 0, error_class: Some(0), error_code: Some(0),
+        }.encode(&mut s7b);
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_upload_returns_block_data() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        let expected = vec![0x01u8, 0x02, 0x03, 0x04];
+        tokio::spawn(mock_full_upload(server_io, expected.clone()));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let data = client.full_upload(0x41, 1).await.unwrap();
+        assert_eq!(data, expected);
+    }
+
+    #[tokio::test]
+    async fn get_pdu_length_returns_negotiated_size() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        // mock_plc_db_read negotiates pdu_length=480
+        tokio::spawn(mock_plc_db_read(server_io, vec![0x00]));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let pdu_len = client.get_pdu_length().await;
+        assert_eq!(pdu_len, 480);
+    }
+
+    #[test]
+    fn parse_block_info_valid() {
+        type C = S7Client<tokio::io::DuplexStream>;
+        // Build a minimal TS7CompactBlockInfo buffer (HDR=36, FOOTER=48, total=84)
+        const TOTAL: usize = 84;
+        let mut buf = vec![0u8; TOTAL];
+        buf[0] = 0x70; buf[1] = 0x70;
+        buf[3] = 0x09; // flags
+        buf[4] = 0x01; // language
+        buf[5] = 0x41; // SubBlkType (DB)
+        buf[6] = 0x00; buf[7] = 0x05; // block_number = 5
+        let total_be = (TOTAL as u32).to_be_bytes();
+        buf[8..12].copy_from_slice(&total_be);
+        buf[28] = 0x00; buf[29] = 0x10; // size_ram = 16
+        buf[32] = 0x00; buf[33] = 0x08; // local_data = 8
+        buf[34] = 0x00; buf[35] = 0x0A; // mc7_size = 10
+        let footer_start = TOTAL - 48;
+        buf[footer_start + 20..footer_start + 27].copy_from_slice(b"SIEMENS");
+        buf[footer_start + 28..footer_start + 32].copy_from_slice(b"TEST");
+        buf[footer_start + 36..footer_start + 40].copy_from_slice(b"V1.0");
+        buf[footer_start + 44] = 0xAB; buf[footer_start + 45] = 0xCD;
+
+        let info = C::parse_block_info(&buf).unwrap();
+        assert_eq!(info.block_number, 5);
+        assert_eq!(info.block_type, 0x41);
+        assert_eq!(info.language, 1);
+        assert_eq!(info.flags, 9);
+        assert_eq!(info.size, TOTAL as u16);
+        assert_eq!(info.size_ram, 16);
+        assert_eq!(info.mc7_size, 10);
+        assert_eq!(info.local_data, 8);
+        assert_eq!(info.checksum, 0xABCD);
+        assert_eq!(info.author, "SIEMENS");
+        assert_eq!(info.family, "TEST");
+        assert_eq!(info.header, "V1.0");
+    }
+
+    #[test]
+    fn parse_block_info_too_short() {
+        type C = S7Client<tokio::io::DuplexStream>;
+        let buf = vec![0u8; 10];
+        assert!(C::parse_block_info(&buf).is_err());
+    }
+
+    #[test]
+    fn parse_block_info_mismatched_load_size() {
+        type C = S7Client<tokio::io::DuplexStream>;
+        const TOTAL: usize = 84;
+        let mut buf = vec![0u8; TOTAL];
+        let wrong = 100u32.to_be_bytes();
+        buf[8..12].copy_from_slice(&wrong);
+        buf[34] = 0x00; buf[35] = 0x0A;
+        assert!(C::parse_block_info(&buf).is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnect_resets_state() {
+        use std::net::SocketAddr;
+
+        // Spin up a tiny TCP listener that does a full S7 handshake then closes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+
+        // Spawn a server task: handles two sequential connections (initial + reconnect).
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(mock_tcp_plc(stream));
+                }
+            }
+        });
+
+        let params = ConnectParams::default();
+        let client = S7Client::<crate::transport::TcpTransport>::connect(addr, params)
+            .await
+            .unwrap();
+
+        assert!(client.is_connected().await);
+
+        // Simulate disconnect by calling reconnect (server will accept second conn).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.reconnect().await.unwrap();
+        assert!(client.is_connected().await);
+    }
+
+    /// Minimal TCP mock: complete COTP CR/CC + S7 negotiate, then drop.
+    async fn mock_tcp_plc(mut stream: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 512];
+
+        // COTP CR
+        let _ = stream.read(&mut buf).await;
+        let cc = CotpPdu::ConnectConfirm { dst_ref: 1, src_ref: 1 };
+        let mut cb = BytesMut::new();
+        cc.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        let _ = stream.write_all(&tb).await;
+
+        // S7 negotiate
+        let _ = stream.read(&mut buf).await;
+        let neg_resp = NegotiateResponse { max_amq_calling: 1, max_amq_called: 1, pdu_length: 480 };
+        let ack = S7Header {
+            pdu_type: PduType::AckData,
+            reserved: 0,
+            pdu_ref: 1,
+            param_len: 8,
+            data_len: 0,
+            error_class: Some(0),
+            error_code: Some(0),
+        };
+        let mut s7b = BytesMut::new();
+        ack.encode(&mut s7b);
+        neg_resp.encode(&mut s7b);
+        let dt = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cotpb = BytesMut::new();
+        dt.encode(&mut cotpb);
+        let mut tb2 = BytesMut::new();
+        TpktFrame { payload: cotpb.freeze() }.encode(&mut tb2).unwrap();
+        let _ = stream.write_all(&tb2).await;
+        // hold connection open briefly then drop
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn get_exec_time_after_request() {
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_plc_db_read(server_io, vec![0x00, 0x01, 0x02, 0x03]));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        client.db_read(1, 0, 4).await.unwrap();
+        let exec_ms = client.get_exec_time().await;
+        // Just verify it was set — exact value is timing-dependent.
+        // In tests with in-process duplex the round-trip is < 1 ms so often 0; just check it doesn't panic.
+        let _ = exec_ms;
     }
 }

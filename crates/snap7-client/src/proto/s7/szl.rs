@@ -43,13 +43,15 @@ impl SzlRequest {
     }
 
     pub fn decode(buf: &mut Bytes) -> Result<Self, ProtoError> {
-        if buf.len() < 12 {
+        // params(8) + data envelope [0xFF,0x09,0x00,0x04](4) + szl_id(2) + szl_index(2) = 16
+        if buf.len() < 16 {
             return Err(ProtoError::BufferTooShort {
-                need: 12,
+                need: 16,
                 have: buf.len(),
             });
         }
         buf.advance(8); // skip param header
+        buf.advance(4); // skip data envelope: [0xFF,0x09,0x00,0x04]
         let szl_id = buf.get_u16();
         let szl_index = buf.get_u16();
         Ok(SzlRequest { szl_id, szl_index })

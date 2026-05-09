@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/snap7-client",
     "crates/snap7-server",
+    "crates/snap7-partner",
     "crates/snap7-opcua-gateway",
     "snap7-cli",
     "snap7-bench",

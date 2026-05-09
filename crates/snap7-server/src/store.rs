@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Area codes recognised by the simulated PLC.
@@ -59,6 +59,10 @@ impl Default for DataStore {
                 data: HashMap::new(),
                 cpu_state: CpuState::Stop,
                 registered_areas: HashMap::new(),
+                locked_areas: HashMap::new(),
+                events: VecDeque::new(),
+                event_mask: 0xFFFF_FFFF,
+                client_count: 0,
                 read_callbacks: Vec::new(),
                 write_callbacks: Vec::new(),
                 event_callbacks: Vec::new(),
@@ -67,12 +71,29 @@ impl Default for DataStore {
     }
 }
 
+/// Server and CPU status returned by [`DataStore::get_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerStatus {
+    /// 0 = stopped, 1 = running
+    pub server_running: bool,
+    pub cpu_state: CpuState,
+    pub clients_count: usize,
+}
+
 struct StoreInner {
     /// `(area_code, db_number, offset) -> byte`
     data: HashMap<(u8, u16, u32), u8>,
     cpu_state: CpuState,
-    /// Set of registered area codes (just the `area_code` portion).
-    registered_areas: HashMap<u8, usize>, // area_code -> size hint
+    /// Set of registered area codes (area_code -> size hint).
+    registered_areas: HashMap<u8, usize>,
+    /// Locked areas — writes to locked areas are rejected.
+    locked_areas: HashMap<u8, bool>,
+    /// Event log queue (capped at 1024).
+    events: VecDeque<EventInfo>,
+    /// Bitmask filter: only events whose kind matches are enqueued.
+    event_mask: u32,
+    /// Connected client count (incremented/decremented by dispatch).
+    pub(crate) client_count: usize,
     read_callbacks: Vec<Box<dyn Fn(&EventInfo) + Send>>,
     write_callbacks: Vec<Box<dyn Fn(&EventInfo) + Send>>,
     event_callbacks: Vec<Box<dyn Fn(&str) + Send>>,
@@ -109,6 +130,82 @@ impl DataStore {
     /// Return the set of registered area codes.
     pub fn registered_areas(&self) -> Vec<u8> {
         self.inner.lock().unwrap().registered_areas.keys().copied().collect()
+    }
+
+    // -- Area lock / unlock --------------------------------------------------
+
+    /// Lock an area: subsequent write_area calls to this area return without
+    /// modifying data (silently skipped, matching C snap7 Srv_LockArea behaviour).
+    pub fn lock_area(&self, area_code: u8) {
+        self.inner.lock().unwrap().locked_areas.insert(area_code, true);
+    }
+
+    /// Unlock an area previously locked with [`lock_area`](Self::lock_area).
+    pub fn unlock_area(&self, area_code: u8) {
+        self.inner.lock().unwrap().locked_areas.remove(&area_code);
+    }
+
+    /// Return whether an area is currently locked.
+    pub fn is_area_locked(&self, area_code: u8) -> bool {
+        self.inner.lock().unwrap().locked_areas.contains_key(&area_code)
+    }
+
+    // -- Server status -------------------------------------------------------
+
+    /// Return current server/CPU status and connected client count.
+    pub fn get_status(&self) -> ServerStatus {
+        let inner = self.inner.lock().unwrap();
+        ServerStatus {
+            server_running: true,
+            cpu_state: inner.cpu_state,
+            clients_count: inner.client_count,
+        }
+    }
+
+    /// Increment the internal client counter (called by dispatch on connect).
+    pub(crate) fn client_connected(&self) {
+        self.inner.lock().unwrap().client_count += 1;
+    }
+
+    /// Decrement the internal client counter (called by dispatch on disconnect).
+    pub(crate) fn client_disconnected(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.client_count = inner.client_count.saturating_sub(1);
+    }
+
+    // -- Event queue ---------------------------------------------------------
+
+    /// Return the current event filter mask.
+    pub fn get_mask(&self) -> u32 {
+        self.inner.lock().unwrap().event_mask
+    }
+
+    /// Set the event filter mask. Only events whose kind-bit is set are enqueued.
+    pub fn set_mask(&self, mask: u32) {
+        self.inner.lock().unwrap().event_mask = mask;
+    }
+
+    /// Drain the event queue.
+    pub fn clear_events(&self) {
+        self.inner.lock().unwrap().events.clear();
+    }
+
+    /// Pop the oldest event from the queue. Returns `None` when empty.
+    pub fn pick_event(&self) -> Option<EventInfo> {
+        self.inner.lock().unwrap().events.pop_front()
+    }
+
+    /// Push an event into the queue (respects mask; queue capped at 1024).
+    #[allow(dead_code)]
+    pub(crate) fn enqueue_event(&self, info: EventInfo, kind_bit: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.event_mask & kind_bit == 0 {
+            return;
+        }
+        if inner.events.len() >= 1024 {
+            inner.events.pop_front(); // drop oldest when full
+        }
+        inner.events.push_back(info);
     }
 
     // -- CPU state -----------------------------------------------------------
@@ -163,8 +260,13 @@ impl DataStore {
     }
 
     /// Write to an arbitrary area.
+    ///
+    /// Silently no-ops if the area is currently locked via [`lock_area`](Self::lock_area).
     pub fn write_area(&self, area: u8, db: u16, start: u32, data: &[u8]) {
         let mut inner = self.inner.lock().unwrap();
+        if inner.locked_areas.contains_key(&area) {
+            return;
+        }
         for (i, &byte) in data.iter().enumerate() {
             if let Some(offset) = start.checked_add(i as u32) {
                 inner.data.insert((area, db, offset), byte);
