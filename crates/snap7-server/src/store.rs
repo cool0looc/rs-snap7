@@ -58,6 +58,7 @@ impl Default for DataStore {
             inner: Arc::new(Mutex::new(StoreInner {
                 data: HashMap::new(),
                 cpu_state: CpuState::Stop,
+                clock: [0u8; 8],
                 registered_areas: HashMap::new(),
                 locked_areas: HashMap::new(),
                 events: VecDeque::new(),
@@ -84,6 +85,8 @@ struct StoreInner {
     /// `(area_code, db_number, offset) -> byte`
     data: HashMap<(u8, u16, u32), u8>,
     cpu_state: CpuState,
+    /// Simulated RTC: 8 BCD bytes in S7 DATE_AND_TIME order.
+    clock: [u8; 8],
     /// Set of registered area codes (area_code -> size hint).
     registered_areas: HashMap<u8, usize>,
     /// Locked areas — writes to locked areas are rejected.
@@ -226,6 +229,18 @@ impl DataStore {
             CpuState::Stop => "cpu_stop",
         };
         self.fire_event(event);
+    }
+
+    // -- Clock ---------------------------------------------------------------
+
+    /// Return the simulated RTC as 8 BCD bytes (S7 DATE_AND_TIME format).
+    pub fn get_clock(&self) -> [u8; 8] {
+        self.inner.lock().unwrap().clock
+    }
+
+    /// Set the simulated RTC from 8 BCD bytes (S7 DATE_AND_TIME format).
+    pub fn set_clock(&self, bytes: [u8; 8]) {
+        self.inner.lock().unwrap().clock = bytes;
     }
 
     // -- Data access (compatible with dispatch) ------------------------------

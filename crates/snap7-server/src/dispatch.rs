@@ -93,7 +93,7 @@ where
                 // UserData: SZL, clock, block info, etc.
                 // payload[4] = method byte: 0x11 = UserData request
                 if payload.len() >= 5 && payload[4] == 0x11 {
-                    handle_user_data(&mut transport, header.pdu_ref, &payload).await?;
+                    handle_user_data(&mut transport, header.pdu_ref, &payload, &store).await?;
                 } else {
                     send_simple_ack(&mut transport, header.pdu_ref).await?;
                 }
@@ -149,10 +149,80 @@ async fn handle_user_data<T: AsyncWrite + Unpin>(
     transport: &mut T,
     pdu_ref: u16,
     payload: &[u8],
+    store: &DataStore,
+) -> Result<()> {
+    // payload[5] = Tg byte: low nibble = function group
+    // 0x44 = grSZL, 0x47 = grClock
+    let tg = if payload.len() >= 6 { payload[5] } else { 0 };
+    let group = tg & 0x0F;
+
+    match group {
+        0x07 => handle_clock_user_data(transport, pdu_ref, payload, store).await,
+        _ => handle_szl_user_data(transport, pdu_ref, payload).await,
+    }
+}
+
+async fn handle_clock_user_data<T: AsyncWrite + Unpin>(
+    transport: &mut T,
+    pdu_ref: u16,
+    payload: &[u8],
+    store: &DataStore,
+) -> Result<()> {
+    // payload[6] = subfn: 0x01 = read clock, 0x02 = set clock
+    let subfn = if payload.len() >= 7 { payload[6] } else { 0 };
+
+    if subfn == 0x02 {
+        // Set clock: datetime bytes start at payload[16] (after 8-byte param + 4-byte envelope + 4 skipped)
+        // Actual layout from client: param(8) + envelope[0xFF,0x09,0x00,0x08] + datetime(8)
+        if payload.len() >= 20 {
+            let mut dt_bytes = [0u8; 8];
+            dt_bytes.copy_from_slice(&payload[12..20]);
+            store.set_clock(dt_bytes);
+        }
+        // Respond: AckData with empty body
+        let header = S7Header {
+            pdu_type: PduType::AckData,
+            reserved: 0,
+            pdu_ref,
+            param_len: 0,
+            data_len: 0,
+            error_class: Some(0),
+            error_code: Some(0),
+        };
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        return send_cotp_data(transport, buf.freeze()).await;
+    }
+
+    // Read clock: respond with real PLC layout:
+    // pdu_type=UserData, param_len=12, data_len=4
+    // datetime bytes span body[8..16] = param[8..12] + data[0..4]
+    let clock = store.get_clock();
+    let mut buf = BytesMut::new();
+    let header = S7Header {
+        pdu_type: PduType::UserData,
+        reserved: 0,
+        pdu_ref,
+        param_len: 12,
+        data_len: 4,
+        error_class: None,
+        error_code: None,
+    };
+    header.encode(&mut buf);
+    // param: 8-byte echo (method=0x12=response, Tg=0x87) + first 4 datetime bytes
+    buf.extend_from_slice(&[0x00, 0x01, 0x12, 0x08, 0x12, 0x87, 0x01, 0x00]);
+    buf.extend_from_slice(&clock[..4]);
+    // data: last 4 datetime bytes
+    buf.extend_from_slice(&clock[4..]);
+    send_cotp_data(transport, buf.freeze()).await
+}
+
+async fn handle_szl_user_data<T: AsyncWrite + Unpin>(
+    transport: &mut T,
+    pdu_ref: u16,
+    payload: &[u8],
 ) -> Result<()> {
     // payload = param(8) + data_envelope(4) + [szl_id:2][szl_index:2]
-    // param: [0x00,0x01,0x12,0x04,0x11,0x44,0x01,0x00]
-    // data:  [0xFF,0x09,0x00,0x04, szl_id_hi, szl_id_lo, idx_hi, idx_lo]
     let szl_id = if payload.len() >= 14 {
         u16::from_be_bytes([payload[12], payload[13]])
     } else {

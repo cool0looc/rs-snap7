@@ -834,12 +834,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
             PduType::UserData,
         )
         .await?;
-        let (_header, mut body) = Self::recv_s7(&mut inner).await?;
-        // Response body: 12-byte param echo + 4-byte data envelope [0xFF,0x09,0x00,0x08] + 8-byte datetime
-        // Skip everything except the last 8 bytes (datetime)
-        if body.remaining() > 8 {
-            body.advance(body.remaining() - 8);
+        let (header, mut body) = Self::recv_s7(&mut inner).await?;
+        // The clock response layout varies by PLC firmware:
+        //   - Standard: param_len=8 (echo), data_len=12 (4-byte envelope + 8-byte datetime)
+        //   - Variant A: param_len=12 (echo+envelope), data_len=8 (datetime only)
+        //   - Variant B: param_len=20 (echo+envelope+datetime), data_len=0
+        // Strategy: take the last 8 bytes of the combined param+data region.
+        let total = header.param_len as usize + header.data_len as usize;
+        if body.remaining() < total || total < 8 {
+            return Err(Error::UnexpectedResponse);
         }
+        body.advance(total - 8);
         Ok(PlcDateTime::decode(&mut body)?)
     }
 
@@ -3127,6 +3132,47 @@ mod tests {
         tokio::spawn(mock_set_clock(server_io));
         let client = S7Client::from_transport(client_io, params).await.unwrap();
         client.set_clock_to_now().await.unwrap();
+    }
+
+    async fn mock_read_clock(mut server_io: tokio::io::DuplexStream, dt: crate::proto::s7::clock::PlcDateTime) {
+        let mut buf = vec![0u8; 4096];
+        mock_handshake(&mut server_io).await;
+        let _ = server_io.read(&mut buf).await;
+        // Real PLC layout (observed): pdu_type=UserData, param_len=12, data_len=4.
+        // The 8-byte datetime spans body[8..16]: last 4 bytes of param + all 4 data bytes.
+        let mut datetime_bytes = bytes::BytesMut::new();
+        dt.encode(&mut datetime_bytes);
+        let param_len: u16 = 12;
+        let data_len: u16 = 4;
+        let mut s7b = BytesMut::new();
+        S7Header {
+            pdu_type: PduType::UserData, reserved: 0, pdu_ref: 2,
+            param_len, data_len, error_class: None, error_code: None,
+        }.encode(&mut s7b);
+        // param: 8-byte echo + 4 bytes (first half of datetime)
+        s7b.extend_from_slice(&[0x00, 0x01, 0x12, 0x08, 0x12, 0x87, 0x01, 0x00]);
+        s7b.extend_from_slice(&datetime_bytes[..4]);
+        // data: last 4 bytes of datetime
+        s7b.extend_from_slice(&datetime_bytes[4..]);
+        let dt_pdu = CotpPdu::Data { tpdu_nr: 0, last: true, payload: s7b.freeze() };
+        let mut cb = BytesMut::new(); dt_pdu.encode(&mut cb);
+        let mut tb = BytesMut::new();
+        TpktFrame { payload: cb.freeze() }.encode(&mut tb).unwrap();
+        server_io.write_all(&tb).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_clock_returns_correct_datetime() {
+        let expected = crate::proto::s7::clock::PlcDateTime {
+            year: 2025, month: 5, day: 9, hour: 14, minute: 30, second: 0,
+            millisecond: 0, weekday: 5,
+        };
+        let (client_io, server_io) = duplex(4096);
+        let params = ConnectParams::default();
+        tokio::spawn(mock_read_clock(server_io, expected.clone()));
+        let client = S7Client::from_transport(client_io, params).await.unwrap();
+        let result = client.read_clock().await.unwrap();
+        assert_eq!(result, expected);
     }
 
     async fn mock_szl_list(mut server_io: tokio::io::DuplexStream, ids: Vec<u16>) {
