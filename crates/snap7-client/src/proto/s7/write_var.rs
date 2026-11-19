@@ -112,10 +112,11 @@ impl WriteVarRequest {
         Ok(WriteVarRequest { items })
     }
 
-    pub fn encode(&self, buf: &mut BytesMut) {
+    /// Encode the parameter section: function code, item count, address items.
+    /// Pair with [`WriteVarRequest::encode_data`].
+    pub fn encode_param(&self, buf: &mut BytesMut) {
         buf.put_u8(FUNC_WRITE_VAR);
         buf.put_u8(self.items.len() as u8);
-        // address items first
         for item in &self.items {
             let addr = &item.address;
             buf.put_u8(ITEM_SPEC);
@@ -133,17 +134,37 @@ impl WriteVarRequest {
             buf.put_u8(((addr_bits >> 8) & 0xFF) as u8);
             buf.put_u8((addr_bits & 0xFF) as u8);
         }
-        // then data items
+    }
+
+    /// Encode the data section: one data item per address item.
+    pub fn encode_data(&self, buf: &mut BytesMut) {
         for item in &self.items {
+            let (transport, length) = data_transport(item.address.transport, item.data.len());
             buf.put_u8(0x00); // reserved
-            buf.put_u8(item.address.transport as u8);
-            let bit_len = (item.data.len() * 8) as u16;
-            buf.put_u16(bit_len);
+            buf.put_u8(transport);
+            buf.put_u16(length);
             buf.put_slice(&item.data);
             if !item.data.len().is_multiple_of(2) {
                 buf.put_u8(0x00); // pad to even boundary
             }
         }
+    }
+}
+
+/// Data-section transport code and length for item data.
+/// These codes differ from the address item word-len codes.
+fn data_transport(t: TransportSize, len: usize) -> (u8, u16) {
+    match t {
+        // Bit: length in bits (S7 sends one byte, one bit)
+        TransportSize::Bit => (0x03, len as u16),
+        // Int/DInt: length in bits
+        TransportSize::Int | TransportSize::DInt => (0x05, (len * 8) as u16),
+        // Real, Char, Counter, Timer: length in bytes
+        TransportSize::Real => (0x07, len as u16),
+        TransportSize::Char => (0x09, len as u16),
+        TransportSize::Timer | TransportSize::Counter => (0x09, len as u16),
+        // Byte/Word/DWord and the rest: length in bits
+        _ => (0x04, (len * 8) as u16),
     }
 }
 
@@ -203,19 +224,22 @@ mod tests {
         let req = WriteVarRequest {
             items: vec![make_write_item(1, 0, &[0xDE, 0xAD])],
         };
-        let mut buf = BytesMut::new();
-        req.encode(&mut buf);
-        // func=0x05, count=1
-        assert_eq!(buf[0], FUNC_WRITE_VAR);
-        assert_eq!(buf[1], 1);
-        // after 12-byte address item: data header at offset 14
-        // reserved=0x00, transport=Byte(0x02), bit_len=16 (0x0010), data=0xDE 0xAD
-        assert_eq!(buf[14], 0x00); // reserved
-        assert_eq!(buf[15], TransportSize::Byte as u8);
-        assert_eq!(buf[16], 0x00);
-        assert_eq!(buf[17], 0x10); // 16 bits
-        assert_eq!(buf[18], 0xDE);
-        assert_eq!(buf[19], 0xAD);
+        let mut param = BytesMut::new();
+        req.encode_param(&mut param);
+        let mut data = BytesMut::new();
+        req.encode_data(&mut data);
+        // param: func=0x05, count=1, one 12-byte address item
+        assert_eq!(param.len(), 14);
+        assert_eq!(param[0], FUNC_WRITE_VAR);
+        assert_eq!(param[1], 1);
+        // data: reserved=0x00, data transport BYTE/WORD/DWORD (0x04), bit_len=16 (0x0010), data=0xDE 0xAD
+        assert_eq!(data.len(), 6);
+        assert_eq!(data[0], 0x00); // reserved
+        assert_eq!(data[1], 0x04);
+        assert_eq!(data[2], 0x00);
+        assert_eq!(data[3], 0x10); // 16 bits
+        assert_eq!(data[4], 0xDE);
+        assert_eq!(data[5], 0xAD);
     }
 
     #[test]
@@ -223,11 +247,14 @@ mod tests {
         let req = WriteVarRequest {
             items: vec![make_write_item(1, 0, &[0xAB])], // 1 byte, odd
         };
-        let mut buf = BytesMut::new();
-        req.encode(&mut buf);
-        // total = 2 (func+count) + 12 (addr) + 4 (data header) + 1 (data) + 1 (pad) = 20
-        assert_eq!(buf.len(), 20);
-        assert_eq!(buf[19], 0x00); // pad byte
+        let mut param = BytesMut::new();
+        req.encode_param(&mut param);
+        let mut data = BytesMut::new();
+        req.encode_data(&mut data);
+        // data item = 4 (header) + 1 (data) + 1 (pad) = 6
+        assert_eq!(param.len(), 14);
+        assert_eq!(data.len(), 6);
+        assert_eq!(data[5], 0x00); // pad byte
     }
 
     #[test]
@@ -240,8 +267,10 @@ mod tests {
     fn write_var_request_encode_decode_roundtrip() {
         let item = make_write_item(3, 4, &[0x11, 0x22, 0x33, 0x44]);
         let req = WriteVarRequest { items: vec![item] };
+        // decode() parses param + data as one stream (server-side view)
         let mut buf = BytesMut::new();
-        req.encode(&mut buf);
+        req.encode_param(&mut buf);
+        req.encode_data(&mut buf);
         let mut b = buf.freeze();
         let decoded = WriteVarRequest::decode(&mut b).unwrap();
         assert_eq!(decoded.items.len(), 1);

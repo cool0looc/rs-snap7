@@ -512,12 +512,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
                     .collect(),
             };
             let mut param_buf = BytesMut::new();
-            req.encode(&mut param_buf);
+            req.encode_param(&mut param_buf);
+            let mut data_buf = BytesMut::new();
+            req.encode_data(&mut data_buf);
 
             Self::send_s7(
                 &mut inner,
                 param_buf.freeze(),
-                Bytes::new(),
+                data_buf.freeze(),
                 pdu_ref,
                 PduType::Job,
             )
@@ -562,12 +564,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
             }],
         };
         let mut param_buf = BytesMut::new();
-        req.encode(&mut param_buf);
+        req.encode_param(&mut param_buf);
+        let mut data_buf = BytesMut::new();
+        req.encode_data(&mut data_buf);
 
         Self::send_s7(
             &mut inner,
             param_buf.freeze(),
-            Bytes::new(),
+            data_buf.freeze(),
             pdu_ref,
             PduType::Job,
         )
@@ -617,12 +621,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> S7Client<T> {
             }],
         };
         let mut param_buf = BytesMut::new();
-        req.encode(&mut param_buf);
+        req.encode_param(&mut param_buf);
+        let mut data_buf = BytesMut::new();
+        req.encode_data(&mut data_buf);
 
         Self::send_s7(
             &mut inner,
             param_buf.freeze(),
-            Bytes::new(),
+            data_buf.freeze(),
             pdu_ref,
             PduType::Job,
         )
@@ -2718,7 +2724,17 @@ mod tests {
 
         // One round-trip per batch
         for (i, item_count) in batches.iter().enumerate() {
-            let _ = server_io.read(&mut buf).await;
+            let n = server_io.read(&mut buf).await.unwrap();
+            // Write data must be in the data section, not the param section
+            let total = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            let mut s7 = Bytes::copy_from_slice(&buf[7..(4 + total).min(n)]);
+            let hdr = S7Header::decode(&mut s7).unwrap();
+            assert_eq!(hdr.pdu_type, PduType::Job);
+            assert_eq!(hdr.param_len, 2 + 12 * (*item_count as u16));
+            assert!(
+                hdr.data_len >= 4 * (*item_count as u16),
+                "write data must be in the data section, not the param section"
+            );
             // WriteVar response: param = func(0x05) + count; data = return_code per item
             let mut s7b = BytesMut::new();
             S7Header {
